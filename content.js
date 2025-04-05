@@ -6,11 +6,10 @@ let lastLine = '';
 let latestLine = '';
 let historyList = [];
 
-let currentSpeaker = '';
-let latestBlock = ''; // 🔄 acumulador que reinicia a cada envio
-let seenLines = new Set(); // 🔁 controle de repetições exatas
+let seenLines = new Set(); // 🔁 controle de repetições
+let latestBySpeaker = new Map(); // 🧠 guarda última fala de cada um
 
-// 🔧 Função para evitar duplicatas e construir histórico + última linha do ciclo
+// 🔧 Função para evitar duplicatas e construir histórico + última fala por pessoa
 function appendNewTranscript(speaker, fullText, origin) {
   const cleanText = fullText.trim();
   if (!cleanText) return;
@@ -32,9 +31,9 @@ function appendNewTranscript(speaker, fullText, origin) {
   historyList.push(singleLine);
   lastLine = cleanText;
 
-  // 🔄 Acumula somente o conteúdo novo desse ciclo de 60s
-  latestBlock += (latestBlock ? ' ' : '') + newContent;
-  latestLine = `🎤 ${origin}: ${speaker}: ${latestBlock}`;
+  // Armazena a última fala do ciclo por pessoa
+  const previous = latestBySpeaker.get(speaker) || '';
+  latestBySpeaker.set(speaker, previous ? `${previous} ${newContent}` : newContent);
 
   console.log(singleLine);
 }
@@ -99,6 +98,14 @@ setInterval(() => {
   if (transcriptData && transcriptData !== lastSavedData) {
     const filename = `transcription-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
 
+    // 📌 Monta a latestLine ordenada por nome
+    const sortedLatest = Array.from(latestBySpeaker.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([speaker, text]) => `🎤 ${speaker}: ${text}`)
+      .join('\n');
+
+    latestLine = sortedLatest;
+
     try {
       if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
         chrome.runtime.sendMessage(
@@ -115,18 +122,17 @@ setInterval(() => {
           }
         );
 
-        console.log("💾 Enviados: histórico completo + última linha nova.");
-
-        // 🧹 Após envio, zera a última linha acumulada
-        latestBlock = '';
-        latestLine = '';
+        console.log("💾 Enviados: histórico completo + últimas falas por pessoa.");
       } else {
-        console.debug("🔒 Contexto sem acesso a chrome.runtime.sendMessage (possivelmente iframe ou sandbox).");
+        console.debug("🔒 Contexto sem acesso a chrome.runtime.sendMessage.");
       }
     } catch (err) {
       console.error("❌ Erro ao enviar transcrição:", err);
     }
 
+    // 🧹 Limpa os dados do ciclo
+    latestBySpeaker.clear();
+    latestLine = '';
     lastSavedData = transcriptData;
   } else {
     console.debug("[sendInterval] Nenhuma nova transcrição para enviar.");
