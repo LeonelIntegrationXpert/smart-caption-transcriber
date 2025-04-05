@@ -2,93 +2,89 @@ console.log("✅ Transcriber content script carregado!");
 
 let transcriptData = '';
 let lastSavedData = '';
-let lastLine = "";
+let lastLine = '';
+let latestLine = '';
+let historyList = [];
+
+let currentSpeaker = '';
+let currentBlock = '';
+let seenLines = new Set(); // 🔁 controle de repetições exatas
+
+// 🔧 Função para evitar duplicatas e construir histórico + última linha concatenada
+function appendNewTranscript(speaker, fullText, origin) {
+  const cleanText = fullText.trim();
+  if (!cleanText) return;
+
+  const key = `${origin}::${speaker}::${cleanText}`;
+  if (seenLines.has(key)) return; // já capturado
+
+  seenLines.add(key);
+
+  let newContent = cleanText;
+  if (lastLine && cleanText.startsWith(lastLine)) {
+    newContent = cleanText.slice(lastLine.length).trim();
+  }
+
+  if (!newContent) return;
+
+  const singleLine = `🎤 ${origin}: ${speaker}: ${newContent}`;
+  transcriptData += singleLine + '\n';
+  historyList.push(singleLine);
+  lastLine = cleanText;
+
+  if (speaker === currentSpeaker) {
+    if (!currentBlock.includes(newContent)) {
+      currentBlock += (currentBlock ? ' ' : '') + newContent;
+    }
+  } else {
+    currentSpeaker = speaker;
+    currentBlock = newContent;
+  }
+
+  latestLine = `🎤 ${origin}: ${speaker}: ${currentBlock}`;
+  console.log(singleLine);
+}
 
 // 🔊 Google Meet
 const captureMeet = () => {
-  const lines = document.querySelectorAll('div[jsname="tgaKEf"]');
-  lines.forEach((line) => {
+  document.querySelectorAll('div[jsname="tgaKEf"]').forEach((line) => {
     const text = line.innerText?.trim();
     if (!text) return;
-
-    const container = line.closest('.nMcdL');
-    let speaker = 'Desconhecido';
-
-    if (container) {
-      const nameEl = container.querySelector('span.NWpY1d');
-      if (nameEl) speaker = nameEl.innerText.trim();
-    }
-
-    const fullText = `${speaker}: ${text}`;
-    if (fullText !== lastLine && !transcriptData.includes(fullText)) {
-      transcriptData += `🎤 Meet: ${fullText}\n`;
-      lastLine = fullText;
-      console.log(`🎤 Meet: ${fullText}`);
-    }
+    const speaker = line.closest('.nMcdL')?.querySelector('span.NWpY1d')?.innerText.trim() || 'Desconhecido';
+    appendNewTranscript(speaker, text, 'Meet');
   });
 };
 
-// 🔊 Microsoft Teams (antigo layout)
+// 🔊 Microsoft Teams (antigo)
 const captureTeamsOld = () => {
-  const captions = document.querySelectorAll('[data-tid="closed-caption-text"]');
-  captions.forEach((caption) => {
+  document.querySelectorAll('[data-tid="closed-caption-text"]').forEach((caption) => {
     const text = caption.innerText?.trim();
     if (!text) return;
-
-    const speakerEl = caption.closest('[data-focuszone-id]')?.querySelector('.ui-chat__message__author');
-    const speaker = speakerEl ? speakerEl.innerText.trim() : "Desconhecido";
-
-    const fullText = `${speaker}: ${text}`;
-    if (fullText !== lastLine && !transcriptData.includes(fullText)) {
-      transcriptData += `🎤 Teams (chat): ${fullText}\n`;
-      lastLine = fullText;
-      console.log(`🎤 Teams (chat): ${fullText}`);
-    }
+    const speaker = caption.closest('[data-focuszone-id]')?.querySelector('.ui-chat__message__author')?.innerText.trim() || 'Desconhecido';
+    appendNewTranscript(speaker, text, 'Teams (chat)');
   });
 };
 
-// 🔊 Microsoft Teams (novo layout)
+// 🔊 Microsoft Teams (novo)
 const captureTeamsNew = () => {
-  const captions = document.querySelectorAll('[data-tid="closed-caption-text"]');
-  captions.forEach((caption) => {
+  document.querySelectorAll('[data-tid="closed-caption-text"]').forEach((caption) => {
     const text = caption?.innerText?.trim();
     if (!text) return;
-
-    const messageEl = caption.closest('.ui-chat__message');
-    const speakerEl = messageEl?.querySelector('.ui-chat__message__author');
-    const speaker = speakerEl?.innerText?.trim() || "Desconhecido";
-
-    const fullText = `${speaker}: ${text}`;
-    if (fullText !== lastLine && !transcriptData.includes(fullText)) {
-      transcriptData += `🎤 Teams (v2): ${fullText}\n`;
-      lastLine = fullText;
-      console.log(`🎤 Teams (v2): ${fullText}`);
-    }
+    const speaker = caption.closest('.ui-chat__message')?.querySelector('.ui-chat__message__author')?.innerText.trim() || 'Desconhecido';
+    appendNewTranscript(speaker, text, 'Teams (v2)');
   });
 };
 
-// 🔊 Slack Huddles (layout atualizado)
+// 🔊 Slack Huddles
 const captureSlack = () => {
-  const events = document.querySelectorAll('.p-huddle_event_log__base_event');
-  events.forEach((event) => {
-    const speakerEl = event.querySelector('.p-huddle_event_log__member_name');
-    const textEl = event.querySelector('.p-huddle_event_log__transcription');
-
-    if (!speakerEl || !textEl) return;
-
-    const speaker = speakerEl.innerText.trim();
-    const text = textEl.innerText.trim();
-    const fullText = `${speaker}: ${text}`;
-
-    if (fullText !== lastLine && !transcriptData.includes(fullText)) {
-      transcriptData += `🎤 Slack: ${fullText}\n`;
-      lastLine = fullText;
-      console.log(`🎤 Slack: ${fullText}`);
-    }
+  document.querySelectorAll('.p-huddle_event_log__base_event').forEach((event) => {
+    const speaker = event.querySelector('.p-huddle_event_log__member_name')?.innerText.trim() || 'Desconhecido';
+    const text = event.querySelector('.p-huddle_event_log__transcription')?.innerText.trim();
+    if (text) appendNewTranscript(speaker, text, 'Slack');
   });
 };
 
-// 🔁 Função principal de detecção
+// 🔁 Função principal de captura
 const captureTranscript = () => {
   const url = window.location.href;
 
@@ -99,33 +95,42 @@ const captureTranscript = () => {
   else console.warn("⚠️ Página não reconhecida.");
 };
 
-// ⏱️ Atraso inicial para garantir que o DOM do Slack Huddles carregue
+// ⏱️ Aguarda 3s (Slack precisa carregar), depois captura a cada 2s
 setTimeout(() => {
   setInterval(captureTranscript, 2000);
 }, 3000);
 
-// 🤖 Envia transcrição para o background a cada 60 segundos
+// 💾 Envia transcrição para o background a cada 60s
 setInterval(() => {
   if (transcriptData && transcriptData !== lastSavedData) {
+    const filename = `transcription-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+
     try {
-      if (chrome.runtime?.sendMessage) {
+      if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
         chrome.runtime.sendMessage(
           {
             action: 'transcriptData',
-            payload: transcriptData
+            payload: {
+              fullHistory: transcriptData,
+              latestLine: latestLine,
+              filename: filename
+            }
           },
           (response) => {
             console.log("📬 Resposta do background:", response);
           }
         );
-        console.log("🤖 Transcrição enviada para o chatbot Rasa.");
+
+        console.log("💾 Enviados: histórico completo + última linha nova.");
       } else {
-        console.warn("⚠️ chrome.runtime.sendMessage não disponível.");
+        console.debug("🔒 Contexto sem acesso a chrome.runtime.sendMessage (possivelmente iframe ou sandbox).");
       }
     } catch (err) {
-      console.error("❌ Erro ao enviar para o background:", err);
+      console.error("❌ Erro ao enviar transcrição:", err);
     }
 
     lastSavedData = transcriptData;
+  } else {
+    console.debug("[sendInterval] Nenhuma nova transcrição para enviar.");
   }
 }, 60000);

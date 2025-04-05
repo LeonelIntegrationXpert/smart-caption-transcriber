@@ -5,7 +5,8 @@
     "description": "Captura transcrições de reuniões no Meet, Teams e Slack e envia para o chatbot.",
     "permissions": [
       "scripting",
-      "tabs"
+      "tabs",
+      "downloads"
     ],
     "host_permissions": [
       "*://meet.google.com/*",
@@ -42,4 +43,3 @@
       "extension_pages": "script-src 'self'; object-src 'self'"
     }
   }
-  
