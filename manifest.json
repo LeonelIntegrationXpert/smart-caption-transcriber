@@ -1,29 +1,45 @@
 {
     "manifest_version": 3,
     "name": "Meeting Transcriber",
-    "version": "1.0",
-    "description": "Captura transcrições automaticamente em reuniões do Teams e Google Meet e salva em arquivo.",
+    "version": "1.1",
+    "description": "Captura transcrições de reuniões no Meet, Teams e Slack e envia para o chatbot.",
     "permissions": [
-      "downloads",
       "scripting",
-      "activeTab"
+      "tabs"
     ],
-    "background": {
-      "service_worker": "background.js"
-    },
+    "host_permissions": [
+      "*://meet.google.com/*",
+      "*://*.teams.microsoft.com/*",
+      "*://teams.live.com/*",
+      "*://*.slack.com/*"
+    ],
     "content_scripts": [
       {
         "matches": [
           "*://meet.google.com/*",
           "*://*.teams.microsoft.com/*",
-          "*://teams.live.com/*"
+          "*://teams.live.com/*",
+          "*://*.slack.com/*"
         ],
         "js": ["content.js"],
-        "run_at": "document_idle"
+        "run_at": "document_idle",
+        "all_frames": true
       }
     ],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "action": {
+      "default_title": "Transcriber",
+      "default_icon": {
+        "128": "icon.png"
+      }
+    },
     "icons": {
       "128": "icon.png"
+    },
+    "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'self'"
     }
   }
   
