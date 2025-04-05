@@ -7,16 +7,16 @@ let latestLine = '';
 let historyList = [];
 
 let currentSpeaker = '';
-let currentBlock = '';
+let latestBlock = ''; // 🔄 acumulador que reinicia a cada envio
 let seenLines = new Set(); // 🔁 controle de repetições exatas
 
-// 🔧 Função para evitar duplicatas e construir histórico + última linha concatenada
+// 🔧 Função para evitar duplicatas e construir histórico + última linha do ciclo
 function appendNewTranscript(speaker, fullText, origin) {
   const cleanText = fullText.trim();
   if (!cleanText) return;
 
   const key = `${origin}::${speaker}::${cleanText}`;
-  if (seenLines.has(key)) return; // já capturado
+  if (seenLines.has(key)) return;
 
   seenLines.add(key);
 
@@ -32,16 +32,10 @@ function appendNewTranscript(speaker, fullText, origin) {
   historyList.push(singleLine);
   lastLine = cleanText;
 
-  if (speaker === currentSpeaker) {
-    if (!currentBlock.includes(newContent)) {
-      currentBlock += (currentBlock ? ' ' : '') + newContent;
-    }
-  } else {
-    currentSpeaker = speaker;
-    currentBlock = newContent;
-  }
+  // 🔄 Acumula somente o conteúdo novo desse ciclo de 60s
+  latestBlock += (latestBlock ? ' ' : '') + newContent;
+  latestLine = `🎤 ${origin}: ${speaker}: ${latestBlock}`;
 
-  latestLine = `🎤 ${origin}: ${speaker}: ${currentBlock}`;
   console.log(singleLine);
 }
 
@@ -122,6 +116,10 @@ setInterval(() => {
         );
 
         console.log("💾 Enviados: histórico completo + última linha nova.");
+
+        // 🧹 Após envio, zera a última linha acumulada
+        latestBlock = '';
+        latestLine = '';
       } else {
         console.debug("🔒 Contexto sem acesso a chrome.runtime.sendMessage (possivelmente iframe ou sandbox).");
       }
