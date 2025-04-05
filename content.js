@@ -4,31 +4,20 @@ let transcriptData = '';
 let lastSavedData = '';
 let filename = 'transcription-' + new Date().toISOString().replace(/[:.]/g, '-') + '.txt';
 
-// Seletor da transcrição de fala
-const selectors = ['div[jsname="tgaKEf"]'];
 let lastLine = "";
 
-// 🔁 Função para capturar transcrição com nome do falante
+// 🔁 Função para capturar transcrição com nome do falante no Google Meet e Microsoft Teams
 const captureTranscript = () => {
   let found = false;
 
-  selectors.forEach((selector) => {
-    const lines = document.querySelectorAll(selector);
-    lines.forEach((line) => {
-      const text = line.innerText?.trim();
-      if (!text) return;
+  // 🔹 Captura para Microsoft Teams (chat com nome + fala)
+  document.querySelectorAll('.ui-chat__item').forEach(item => {
+    const speakerEl = item.querySelector('.ui-chat__message__author');
+    const textEl = item.querySelector('[data-tid="closed-caption-text"]');
 
-      // Sobe até o contêiner do nome do falante
-      const container = line.closest('.nMcdL');
-      let speaker = 'Desconhecido';
-
-      if (container) {
-        const nameEl = container.querySelector('span.NWpY1d');
-        if (nameEl) {
-          speaker = nameEl.innerText.trim();
-        }
-      }
-
+    if (speakerEl && textEl) {
+      const speaker = speakerEl.innerText.trim();
+      const text = textEl.innerText.trim();
       const fullText = `${speaker}: ${text}`;
 
       if (
@@ -38,10 +27,38 @@ const captureTranscript = () => {
       ) {
         transcriptData += fullText + '\n';
         lastLine = fullText;
-        console.log("📄 Capturado:", fullText);
+        console.log("🎤 [Teams] Capturado:", fullText);
         found = true;
       }
-    });
+    }
+  });
+
+  // 🔹 Captura para Google Meet (legenda com nome do falante)
+  document.querySelectorAll('div[jsname="tgaKEf"]').forEach(line => {
+    const text = line.innerText?.trim();
+    if (!text) return;
+
+    const container = line.closest('.nMcdL');
+    let speaker = 'Desconhecido';
+
+    if (container) {
+      const nameEl = container.querySelector('span.NWpY1d');
+      if (nameEl) {
+        speaker = nameEl.innerText.trim();
+      }
+    }
+
+    const fullText = `${speaker}: ${text}`;
+    if (
+      fullText !== lastLine &&
+      !transcriptData.includes(fullText) &&
+      !lastLine.includes(fullText)
+    ) {
+      transcriptData += fullText + '\n';
+      lastLine = fullText;
+      console.log("🎤 [Meet] Capturado:", fullText);
+      found = true;
+    }
   });
 
   if (!found) {
@@ -55,7 +72,7 @@ setInterval(() => {
   captureTranscript();
 }, 2000);
 
-// 💾 Salva a cada 1 minuto, sem callback (corrigido)
+// 💾 Salva a cada 1 minuto
 setInterval(() => {
   console.log("💾 Verificando se há novas transcrições para salvar...");
 

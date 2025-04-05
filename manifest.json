@@ -15,7 +15,8 @@
       {
         "matches": [
           "*://meet.google.com/*",
-          "*://*.teams.microsoft.com/*"
+          "*://*.teams.microsoft.com/*",
+          "*://teams.live.com/*"
         ],
         "js": ["content.js"],
         "run_at": "document_idle"
