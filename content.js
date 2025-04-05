@@ -9,8 +9,16 @@ let historyList = [];
 let seenLines = new Set(); // 🔁 controle de repetições
 let latestBySpeaker = new Map(); // 🧠 guarda última fala de cada um
 
+// 🧍‍♂️ Lista de nomes que representam você
+const myKnownNames = new Set(["Você", "Leonel Dorneles Porto"]);
+
 // 🔧 Função para evitar duplicatas e construir histórico + última fala por pessoa
 function appendNewTranscript(speaker, fullText, origin) {
+  if (!speaker || myKnownNames.has(speaker)) {
+    console.debug(`[IGNORADO] Fala própria: '${speaker}'`);
+    return;
+  }
+
   const cleanText = fullText.trim();
   if (!cleanText) return;
 
