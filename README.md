@@ -157,7 +157,7 @@ Desenvolvido com 💙 por [**Leonel Dorneles Porto**](https://www.linkedin.com/i
 <!-- ✍️ Mensagem animada (Typing Effect) -->
 <p align="center">
   <img 
-    src="https://readme-typing-svg.demolab.com?font=Fira+Code&pause=1000&color=47E3FF&center=true&width=600&lines=Obrigado+por+visitar!+🚀;Vamos+conectar+no+LinkedIn!+💼;MuleSoft+%7C+Salesforce+%7C+API+Integration+Expert+🔌;Smart+Caption+Trailblazer+🏆"
+    src="https://readme-typing-svg.demolab.com?font=Fira+Code&pause=1000&color=47E3FF&center=true&width=600&lines=Obrigado+por+visitar!+🚀;Vamos+conectar+no+LinkedIn!+💼;MuleSoft+%7C+Salesforce+%7C+API+Integration+Expert+🔌;Smart+Caption+%7C+Trailblazer+🏆"
     alt="Typing SVG Footer"
   />
 </p>
