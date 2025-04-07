@@ -115,13 +115,13 @@ Desenvolvido com 💙 por [**Leonel Dorneles Porto**](https://www.linkedin.com/i
 ## 📬 Contato
 
 <p align="center">
-  <a href="mailto:leoneldornelesporto@outlook.com.br">
+  <a href="mailto:leoneldornelesporto@outlook.com.br" target="_blank" rel="noopener noreferrer">
     <img src="https://img.shields.io/badge/Email-leoneldornelesporto%40outlook.com.br-D14836?style=for-the-badge&logo=gmail&logoColor=white" alt="Email"/>
   </a>
-  <a href="https://www.linkedin.com/in/leonel-dorneles-porto-b88600122">
+  <a href="https://www.linkedin.com/in/leonel-dorneles-porto-b88600122" target="_blank" rel="noopener noreferrer">
     <img src="https://img.shields.io/badge/LinkedIn-Leonel%20Porto-0077B5?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"/>
   </a>
-  <a href="https://github.com/LeonelIntegrationXpert">
+  <a href="https://github.com/LeonelIntegrationXpert" target="_blank" rel="noopener noreferrer">
     <img src="https://img.shields.io/badge/GitHub-LeonelIntegrationXpert-181717?style=for-the-badge&logo=github" alt="GitHub"/>
   </a>
 </p>
@@ -131,4 +131,3 @@ Desenvolvido com 💙 por [**Leonel Dorneles Porto**](https://www.linkedin.com/i
 <p align="center">
   <img src="https://capsule-render.vercel.app/api?type=waving&color=0:47e3ff,100:147AD6&height=100&section=footer" alt="Footer Wave Animation" />
 </p>
-```
