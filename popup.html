@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <title>Transcriber</title>
+  <style>
+    body { font-family: Arial, sans-serif; width: 420px; margin: 10px; }
+
+    .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+    button { padding: 6px 10px; cursor: pointer; }
+
+    textarea {
+      width: 100%;
+      height: 180px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      padding: 8px;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+
+    input, select { padding: 6px 8px; width: 100%; box-sizing: border-box; }
+
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 10px; margin-top: 10px; }
+    .label { font-size: 12px; color: #444; margin-bottom: 6px; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .status { font-size: 12px; color: #666; margin-top: 6px; }
+
+    /* Mini-tabs (Popup) */
+    .tabs { display: flex; gap: 6px; margin: 6px 0 10px; }
+    .tab-btn {
+      border: 1px solid #ddd;
+      background: #f6f6f6;
+      border-radius: 10px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .tab-btn.active { background: #fff; border-color: #bbb; font-weight: 600; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+  </style>
+</head>
+
+<body>
+  <div class="row">
+    <button id="btnRefresh">Refresh</button>
+    <button id="btnCopy">Copy</button>
+    <button id="btnClear">Clear</button>
+    <button id="btnSuggest">Suggest</button>
+    <button id="btnOpenTab">Open Tab</button>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button id="tabPopupDialogBtn" class="tab-btn active" type="button">Diálogo</button>
+    <button id="tabPopupSettingsBtn" class="tab-btn" type="button">Config</button>
+  </div>
+
+  <!-- TAB: DIÁLOGO -->
+  <div id="tabPopupDialog" class="tab-panel active">
+    <div class="card">
+      <div class="label">Transcript (latest)</div>
+      <textarea id="transcript" readonly>No data yet.</textarea>
+      <div class="status" id="lastUpdate"></div>
+    </div>
+
+    <div class="card">
+      <div class="label">Suggested reply</div>
+      <textarea id="suggestion" readonly></textarea>
+      <div class="status" id="suggestStatus"></div>
+    </div>
+  </div>
+
+  <!-- TAB: CONFIG -->
+  <div id="tabPopupSettings" class="tab-panel">
+    <div class="card">
+      <div class="label">Llama settings</div>
+
+      <div class="two">
+        <div>
+          <div class="label">Mode</div>
+          <select id="llamaMode">
+            <option value="openai">OpenAI</option>
+            <option value="ollama">Ollama</option>
+            <option value="python">Python (FastAPI)</option>
+          </select>
+        </div>
+        <div>
+          <div class="label">Model</div>
+          <input id="llamaModel" placeholder="ex: llama3.1:8b-instruct" />
+        </div>
+      </div>
+
+      <div style="margin-top:8px;">
+        <div class="label">Endpoint</div>
+        <input id="llamaEndpoint" placeholder="http://localhost:8080/v1/chat/completions" />
+      </div>
+
+      <div style="margin-top:8px;">
+        <div class="label">API Key (optional)</div>
+        <input id="llamaApiKey" placeholder="optional" />
+      </div>
+
+      <div style="margin-top:8px;">
+        <div class="label">System prompt (optional)</div>
+        <input id="llamaSystemPrompt" placeholder="Gere uma resposta curta, objetiva e sem perguntas." />
+      </div>
+
+      <div class="row" style="margin-top:8px;">
+        <button id="btnSaveSettings">Save</button>
+      </div>
+
+      <div class="status" id="settingsStatus"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
