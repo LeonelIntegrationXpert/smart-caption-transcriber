@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # server.py — FastAPI proxy -> Ollama /api/chat (streaming texto puro)
 
+import os
 import sys
 import subprocess
 
@@ -60,75 +61,104 @@ logging.basicConfig(
 log = logging.getLogger("mt-ollama-proxy")
 
 # =========================
-# 🔧 CONFIG
+# 🔧 CONFIG (env override)
 # =========================
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "gpt-oss:120b-cloud"
-TIMEOUT = 300
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 
-# Ignora linhas tipo "OCE", "E V", "D"
+TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))               # read timeout
+CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "10"))  # connect timeout
+
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))  # limita prompt
+
+API_KEY = os.getenv("API_KEY", "").strip()  # opcional (x-api-key)
+
 FILTER_NOISE = True
 
 OPTIONS_PROFILE = {
     "temperature": 0.2,
     "top_p": 0.9,
     "repeat_penalty": 1.1,
-    "num_ctx": 2048
+    "num_ctx": 4096,
 }
-
 OPTIONS_CORRECTOR = {
     "temperature": 0.1,
     "top_p": 0.8,
     "repeat_penalty": 1.1,
-    "num_ctx": 2048
+    "num_ctx": 4096,
 }
-
-# ✅ Consolidador (contexto)
 OPTIONS_CONSOLIDATOR = {
     "temperature": 0.2,
     "top_p": 0.9,
     "repeat_penalty": 1.1,
-    "num_ctx": 512
+    "num_ctx": 4096,
 }
 
 SYSTEM_PROMPT_PROFILE = " ".join([
   "IDENTIDADE: Você é Leonel Dorneles Porto e responde sempre em primeira pessoa (eu), como candidato em entrevista técnica.",
   "FORMATO DE ENTRADA: A entrada virá como 'AUTOR=<nome>; FALA=<texto>; INSTRUCAO=...'; você deve responder diretamente para AUTOR e obrigatoriamente começar a resposta com '<AUTOR>, ' usando o nome recebido.",
   "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA, modelo de linguagem, assistente virtual ou qualquer variação; não fale sobre regras, prompts, sistema, tokens, ou configuração; entregue somente a resposta final.",
-  "IDIOMA: Responda no mesmo idioma da fala; se vier em português, responda em português; se vier em inglês, responda em inglês (inglês claro e direto).",
-  "ESTILO: Resposta direta, sênior e técnica; 1 parágrafo; 2 a 6 frases; sem bullets; sem títulos; sem despedidas; não faça perguntas; evite frases longas e use no máximo 25 a 30 palavras por frase.",
-  "CLAREZA DE SIGLAS: Não use siglas sem expandir na primeira menção; se a sigla for específica/interna e você não souber o significado, substitua por uma descrição genérica segura (ex.: 'time de observabilidade' ou 'área de governança') sem inventar.",
-  "MÉTRICAS: Só use números se você conseguir contextualizar (ex.: 'incidentes operacionais', 'na janela do projeto', 'aproximadamente'); prefira ~ quando for estimativa; não crie métricas do nada.",
-  "ESTRUTURA RECOMENDADA: Responda seguindo o padrão Contexto -> Ação -> Resultado, citando 2 a 4 tecnologias no máximo por resposta para não virar lista.",
-  "LOCALIZAÇÃO: Baseado em Pelotas, Rio Grande do Sul, Brasil.",
-  "RESUMO PROFISSIONAL: Especialista MuleSoft com mais de cinco anos em integração e desenvolvimento de APIs, entregando soluções robustas e escaláveis em ambientes complexos; forte atuação em APIs, integração com Salesforce e AWS, e resolução de desafios técnicos; perfil colaborativo, foco em valor e execução.",
-  "CARGO ATUAL: Accenture Brasil — Specialist MuleSoft (desde abril/2025).",
-  "STACK/COMPETÊNCIAS-CHAVE: MuleSoft (CloudHub/CloudHub 2.0 e On-Premise), Anypoint Platform, API-led connectivity, RAML design-first, API Manager, Exchange, Runtime Manager, REST/SOAP/OData, Anypoint MQ e RabbitMQ, DataWeave, MUnit, observabilidade (Visualizer/Monitoring), integração com Salesforce, AWS (S3/multipart), bancos (Oracle/MySQL/MongoDB) e SAP; pipelines CI/CD (Jenkins/GitHub Actions).",
-  "IDIOMAS: Português nativo; Inglês nível profissional limitado.",
-  "REGRAS DE CONFIDENCIALIDADE: Evite expor segredos, chaves, tokens, endpoints internos, IDs sensíveis e detalhes confidenciais; quando necessário, descreva arquitetura e decisões técnicas sem revelar informação sensível.",
-  "AUTOAPRESENTAÇÃO: Se a fala for 'me fala de você' ou equivalente, responda com um pitch de 4 a 6 frases com cargo atual, anos de experiência, foco técnico (MuleSoft/Salesforce/APIs/segurança/CI-CD), 2-3 highlights e como gera valor."
+  "IDIOMA: Responda no mesmo idioma da fala; se vier em português, responda em português; se vier em inglês, responda em inglês.",
+  "ESTILO/FORMATO: Responda em NO MÍNIMO 10 linhas, separadas por '\\n'.",
+  "LINHAS: Cada linha deve ser curta (ideal 8 a 14 palavras) e objetiva.",
+  "PROIBIDO: Não use bullets ('-', '*', '•'), não use numeração (1., 2.), não use títulos, não faça perguntas.",
+  "REGRA DO AUTOR: A PRIMEIRA LINHA deve começar exatamente com '<AUTOR>, '. As próximas linhas continuam direto sem repetir o autor.",
+  "CLAREZA: Expanda siglas na primeira menção; se não souber sigla interna, descreva genericamente sem inventar.",
+  "MÉTRICAS: Só use números se fizer sentido e forem defensáveis; prefira ~ se for estimativa.",
+  "AUTOAPRESENTAÇÃO: Se a fala for 'me fale sobre você' ou equivalente, gere um pitch em 10+ linhas cobrindo: cargo atual, tempo, foco técnico, 2-3 impactos, 2-4 tecnologias, e como gera valor."
 ])
+
 
 SYSTEM_PROMPT_CORRECTOR = " ".join([
   "MODO: Você é um corretor gramatical e ortográfico.",
-  "TAREFA: Corrigir o texto do usuário mantendo o significado, o tom e o idioma; melhorar pontuação e concordância; remover repetição e vícios de linguagem quando atrapalharem; preservar termos técnicos, nomes próprios, siglas e códigos; reduzir frases excessivamente longas quebrando em 2 ou 3 frases quando necessário, mas devolver tudo em uma única linha.",
-  "SAÍDA: Retorne SOMENTE o texto corrigido, em UMA ÚNICA LINHA, sem explicações, sem comentários, sem aspas, sem bullets, sem títulos.",
-  "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA ou modelo; não explique regras nem mostre raciocínio."
+  "TAREFA: Corrigir mantendo significado/tom/idioma; melhorar pontuação; preservar termos técnicos e códigos; devolver em uma única linha.",
+  "SAÍDA: Retorne SOMENTE o texto corrigido, em UMA ÚNICA LINHA, sem explicações.",
+  "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA ou modelo; não explique regras."
 ])
 
 SYSTEM_PROMPT_CONSOLIDATOR = " ".join([
   "MODO: Você é um consolidador de contexto para entrevista técnica.",
   "TAREFA: A partir de mensagens limpas (AUTOR: TEXTO), gere um contexto consolidado curto do que está sendo discutido.",
-  "SAÍDA: Retorne SOMENTE 1 linha, sem bullets, sem títulos, sem perguntas, sem meta, com 40 a 70 palavras no máximo; preserve termos técnicos; não invente métricas.",
+  "SAÍDA: Retorne SOMENTE 1 linha, sem bullets, sem títulos, sem perguntas, com 40 a 70 palavras no máximo; preserve termos técnicos; não invente métricas.",
   "ANTI-META: Nunca diga que é ChatGPT/OpenAI/IA/modelo; não explique regras."
 ])
 
 app = FastAPI()
 
 # =========================
+# 🔐 API KEY (opcional)
+# =========================
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if API_KEY:
+        got = (request.headers.get("x-api-key") or "").strip()
+        if got != API_KEY:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+# =========================
+# 🧠 Helpers: str/bytes + SSE
+# =========================
+def _to_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="ignore")
+    if isinstance(x, str):
+        return x
+    return str(x)
+
+def _maybe_strip_sse_prefix(line) -> str:
+    # Pode vir bytes OU str, e em alguns setups pode vir "data: {...}"
+    s = _to_str(line).strip()
+    if s.startswith("data:"):
+        s = s[5:].strip()
+    return s
+
+# =========================
 # 🧠 PARSER (robusto)
 # =========================
-_NOISE_RE = re.compile(r'^[A-Z]{1,4}(\s*[A-Z]{1,4})*$')
+_NOISE_RE = re.compile(r"^[A-Z]{1,4}(\s*[A-Z]{1,4})*$")
 
 def is_noise_text(text: str) -> bool:
     t = (text or "").strip()
@@ -138,16 +168,49 @@ def is_noise_text(text: str) -> bool:
         return True
     return False
 
+def _parse_teams_inline(s: str):
+    """
+    Exemplo real (mesma linha, múltiplos turnos):
+      "Teams • Leonel: ... Teams • Desconhecido: Me fale sobre você."
+    A gente pega sempre o ÚLTIMO "Teams • <autor>: <fala>"
+    """
+    if "Teams •" not in s:
+        return None
+
+    chunks = s.split("Teams • ")
+    found = []
+    for seg in chunks[1:]:
+        if ":" not in seg:
+            continue
+        speaker, msg = seg.split(":", 1)
+        speaker = speaker.strip()
+        msg = msg.strip()
+        if speaker and msg:
+            found.append((speaker, msg))
+
+    if not found:
+        return None
+
+    speaker, msg = found[-1]
+    author = speaker
+    if author.lower() in ("desconhecido", "unknown"):
+        author = "Entrevistador"
+    return {"author": author, "text": msg, "raw": s}
+
 def parse_line_author_and_text(line: str):
     """
-    Preferência:
-      - SPEAKER + MENSAGEM pelos 2 últimos ':'  =>  <...>: <SPEAKER>: <MENSAGEM>
-    Fallback:
-      - AUTOR pelo primeiro ':'               =>  <AUTOR>: <FALA>
+    Prioridade:
+      1) Teams inline (múltiplos turnos na mesma linha)
+      2) SPEAKER + MENSAGEM pelos 2 últimos ':'  =>  <...>: <SPEAKER>: <MENSAGEM>
+      3) Fallback: AUTOR pelo primeiro ':'      =>  <AUTOR>: <FALA>
     """
     s = (line or "").strip()
     if not s or ":" not in s:
         return None
+
+    p = _parse_teams_inline(s)
+    if p:
+        return p
 
     parts = [p.strip() for p in s.rsplit(":", 2)]
     if len(parts) == 3:
@@ -169,7 +232,13 @@ def parse_line_author_and_text(line: str):
     return {"author": author, "text": text, "raw": s}
 
 def extract_last_valid(raw: str):
-    lines = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()]
+    raw = raw or ""
+    # ✅ se veio tudo em 1 linha (Teams inline), resolve logo
+    p_inline = _parse_teams_inline(raw.strip())
+    if p_inline and (not FILTER_NOISE or not is_noise_text(p_inline["text"])):
+        return p_inline
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     for ln in reversed(lines):
         p = parse_line_author_and_text(ln)
         if not p:
@@ -185,7 +254,10 @@ def build_profile_user_text(raw_prompt: str) -> str:
         return raw_prompt.strip()
     author = last["author"]
     text = last["text"]
-    return f"AUTOR={author}; FALA={text}; INSTRUCAO=Responda diretamente para AUTOR e comece a resposta com '{author}, '"
+    return (
+        f"AUTOR={author}; FALA={text}; "
+        f"INSTRUCAO=Responda diretamente para AUTOR e comece a resposta com '{author}, '"
+    )
 
 # =========================
 # 🧠 CONTEXTO CONSOLIDADO (buffer + cache + async)
@@ -207,7 +279,6 @@ def push_clean_message(author: str, text: str, max_keep: int = 60):
             del CLEAN_BUFFER[:-max_keep]
 
 def build_consolidator_input(msgs):
-    # 1 linha só pra não virar bagunça
     s = " | ".join([f'{m["author"]}: {m["text"]}' for m in msgs])
     return f"MENSAGENS={s}"
 
@@ -221,7 +292,11 @@ def call_ollama_sync(system_prompt: str, user_text: str, options: dict) -> str:
         ],
         "options": options,
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=TIMEOUT)
+    r = requests.post(
+        OLLAMA_URL,
+        json=payload,
+        timeout=(CONNECT_TIMEOUT, TIMEOUT),
+    )
     r.raise_for_status()
     data = r.json()
     out = ((data.get("message") or {}).get("content")) or ""
@@ -231,27 +306,36 @@ def refresh_context_sync():
     global CONTEXT_TEXT, LAST_CONTEXT_HASH, LAST_CONTEXT_AT
 
     with STATE_LOCK:
-        msgs = CLEAN_BUFFER[-20:]  # últimas 20 mensagens limpas
+        msgs = CLEAN_BUFFER[-20:]
+        current_ctx = CONTEXT_TEXT
+        current_hash = LAST_CONTEXT_HASH
+
     if not msgs:
         return ""
 
     h = _hash_messages(msgs)
-    if h == LAST_CONTEXT_HASH and CONTEXT_TEXT:
-        return CONTEXT_TEXT
+    if h == current_hash and current_ctx:
+        return current_ctx
 
-    ctx = call_ollama_sync(SYSTEM_PROMPT_CONSOLIDATOR, build_consolidator_input(msgs), OPTIONS_CONSOLIDATOR)
+    ctx = call_ollama_sync(
+        SYSTEM_PROMPT_CONSOLIDATOR,
+        build_consolidator_input(msgs),
+        OPTIONS_CONSOLIDATOR,
+    )
 
     with STATE_LOCK:
         CONTEXT_TEXT = ctx
         LAST_CONTEXT_HASH = h
         LAST_CONTEXT_AT = time.time()
-    return ctx
+        return CONTEXT_TEXT
 
 def refresh_context_background():
     try:
         ctx = refresh_context_sync()
         if ctx:
-            log.info("[context] updated_at=%.0f ctx_preview=%r", LAST_CONTEXT_AT, ctx[:160])
+            with STATE_LOCK:
+                at = LAST_CONTEXT_AT
+            log.info("[context] updated_at=%.0f ctx_preview=%r", at, ctx[:160])
     except Exception as e:
         log.info("[context] erro ao gerar contexto: %s", e)
 
@@ -269,10 +353,19 @@ def stream_ollama_chat(system_prompt: str, user_text: str, options: dict, saniti
         "options": options,
     }
 
-    with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=TIMEOUT) as r:
+    with requests.post(
+        OLLAMA_URL,
+        json=payload,
+        stream=True,
+        timeout=(CONNECT_TIMEOUT, TIMEOUT),
+    ) as r:
         r.raise_for_status()
 
         for raw_line in r.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+
+            raw_line = _maybe_strip_sse_prefix(raw_line)
             if not raw_line:
                 continue
 
@@ -297,10 +390,26 @@ def stream_ollama_chat(system_prompt: str, user_text: str, options: dict, saniti
 # =========================
 # ✅ ENDPOINTS
 # =========================
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+def _read_prompt_json(body: dict) -> str:
+    prompt = str((body or {}).get("prompt", "")).strip()
+    if not prompt:
+        return ""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        prompt = prompt[:MAX_PROMPT_CHARS]
+    return prompt
+
 @app.post("/ask")
 async def ask(req: Request):
-    body = await req.json()
-    prompt = str(body.get("prompt", "")).strip()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    prompt = _read_prompt_json(body)
     if not prompt:
         return JSONResponse({"error": "missing prompt"}, status_code=400)
 
@@ -313,8 +422,12 @@ async def ask(req: Request):
 
 @app.post("/ask_me")
 async def ask_me(req: Request, background_tasks: BackgroundTasks):
-    body = await req.json()
-    prompt = str(body.get("prompt", "")).strip()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    prompt = _read_prompt_json(body)
     if not prompt:
         return JSONResponse({"error": "missing prompt"}, status_code=400)
 
@@ -324,8 +437,6 @@ async def ask_me(req: Request, background_tasks: BackgroundTasks):
     if last:
         log.info("[/ask_me] last_raw=%r", last["raw"][:280])
         log.info("[/ask_me] parsed_author=%r parsed_text=%r", last["author"], last["text"][:200])
-
-        # ✅ alimenta buffer limpo e dispara consolidação em background
         push_clean_message(last["author"], last["text"])
         background_tasks.add_task(refresh_context_background)
     else:
@@ -335,23 +446,18 @@ async def ask_me(req: Request, background_tasks: BackgroundTasks):
     log.info("[/ask_me] clean_prompt=%r", clean_prompt[:320])
 
     return StreamingResponse(
-        stream_ollama_chat(SYSTEM_PROMPT_PROFILE, clean_prompt, OPTIONS_PROFILE, sanitize_newlines=True),
+        stream_ollama_chat(SYSTEM_PROMPT_PROFILE, clean_prompt, OPTIONS_PROFILE, sanitize_newlines=False),
         media_type="text/plain; charset=utf-8",
     )
 
-# =========================
-# ✅ NOVOS ENDPOINTS (Contexto consolidado)
-# =========================
 @app.post("/context_ingest")
 async def context_ingest(req: Request, background_tasks: BackgroundTasks):
-    """
-    Envia a transcrição (histórico) e o servidor:
-      - pega a última linha útil
-      - salva no buffer limpo
-      - dispara consolidação assíncrona
-    """
-    body = await req.json()
-    prompt = str(body.get("prompt", "")).strip()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    prompt = _read_prompt_json(body)
     if not prompt:
         return JSONResponse({"error": "missing prompt"}, status_code=400)
 
@@ -364,12 +470,17 @@ async def context_ingest(req: Request, background_tasks: BackgroundTasks):
 
     log.info("[/context_ingest] author=%r text=%r", last["author"], last["text"][:180])
 
+    with STATE_LOCK:
+        buf_size = len(CLEAN_BUFFER)
+        ctx = CONTEXT_TEXT
+        at = LAST_CONTEXT_AT
+
     return {
         "accepted": True,
         "parsed": {"author": last["author"], "text": last["text"], "raw": last["raw"]},
-        "buffer_size": len(CLEAN_BUFFER),
-        "context_current": CONTEXT_TEXT,
-        "context_updated_at": LAST_CONTEXT_AT,
+        "buffer_size": buf_size,
+        "context_current": ctx,
+        "context_updated_at": at,
     }
 
 @app.get("/context")
@@ -379,17 +490,16 @@ def get_context():
             "context": CONTEXT_TEXT,
             "updated_at": LAST_CONTEXT_AT,
             "buffer_size": len(CLEAN_BUFFER),
-            "last_items": CLEAN_BUFFER[-3:],  # debug leve
+            "last_items": CLEAN_BUFFER[-3:],
         }
 
 @app.post("/context_refresh")
 def context_refresh():
-    """
-    Força gerar contexto na hora (bom pro botão "Reformular").
-    """
     try:
         ctx = refresh_context_sync()
-        return {"ok": True, "context": ctx, "updated_at": LAST_CONTEXT_AT}
+        with STATE_LOCK:
+            at = LAST_CONTEXT_AT
+        return {"ok": True, "context": ctx, "updated_at": at}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -403,4 +513,5 @@ def get_buffer():
 # =========================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

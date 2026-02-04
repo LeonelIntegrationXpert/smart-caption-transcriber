@@ -2,8 +2,10 @@
  * - NUNCA usa window/document/localStorage
  * - Usa globalThis
  * - Mantém: transcriptTick anti-spam, rewriteContext, generateSuggestion, generateReplies (2 rotas)
+ * - FIX: AbortError (DOMException) não vira erro
+ * - FIX: rewrite não é abortado por suggest/replies (stream.kind)
+ * - FIX: generateReplies retorna {positivo, negativo} top-level + suggestions
  */
-
 "use strict";
 
 // ✅ MV3: não existe window/document. Use globalThis/self.
@@ -15,6 +17,7 @@ const PYTHON_PATH_SUGGEST = "/ask_me";
 
 const state = {
   payload: null, // { fullHistory, latestLine, timestamp }
+
   suggestion: "",
   suggestionAt: "",
 
@@ -34,15 +37,17 @@ const state = {
   conversation: [], // [{timestamp, origin, speaker, text}]
   activeMeetingTabId: null,
 
+  // ✅ stream único com "kind" pra não derrubar rewrite com suggest (e vice-versa)
   stream: {
+    kind: null, // "rewrite" | "suggest"
     abort: null,
     requestId: null,
     text: "",
   },
 };
 
-// (Opcional) pra debugar no DevTools do service worker:
-// abre chrome://extensions -> Inspect views -> service worker
+// (Opcional) debugar no DevTools do service worker:
+// chrome://extensions -> Inspect views -> service worker
 G.__MT_STATE__ = state;
 
 // =========================
@@ -129,8 +134,8 @@ function tailChars(s, maxChars) {
 function normalizePythonEndpoint(baseOrFull, path, defaultBase = DEFAULT_PYTHON_BASE_URL) {
   const desiredPath = String(path || "").startsWith("/") ? String(path) : `/${path || ""}`;
   const raw = String(baseOrFull || "").trim();
-
   const baseDefault = String(defaultBase || "").replace(/\/+$/, "");
+
   if (!raw) return baseDefault + desiredPath;
 
   if (!/^https?:\/\//i.test(raw)) {
@@ -153,13 +158,31 @@ function makeRequestId() {
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
-function abortActiveStream() {
+function isAbortError(err) {
+  if (!err) return false;
+  if (err.name === "AbortError") return true; // DOMException típica
+  const msg = String(err?.message || err);
+  return /aborted|aborterror|The user aborted|signal is aborted/i.test(msg);
+}
+
+/**
+ * Aborta SOMENTE se:
+ * - kind não foi informado (força abort), OU
+ * - stream atual não tem kind, OU
+ * - kind === state.stream.kind
+ *
+ * Assim: suggest/replies NÃO derrubam rewrite.
+ */
+function abortActiveStream(kind) {
   try {
+    if (kind && state.stream.kind && state.stream.kind !== kind) return false;
     state.stream.abort?.abort();
   } catch {}
   state.stream.abort = null;
   state.stream.requestId = null;
   state.stream.text = "";
+  state.stream.kind = null;
+  return true;
 }
 
 function resolveTargetTabId(sender) {
@@ -173,9 +196,9 @@ function resolveTargetTabId(sender) {
 // Anti-spam reducer (Teams incremental transcript)
 // =========================
 const tickAgg = {
-  recent: new Map(),      // key(origin||speaker||text) -> ts
-  recentText: new Map(),  // text -> ts
-  lastByKey: new Map(),   // key(origin||speaker) -> { idx, ts, text }
+  recent: new Map(), // key(origin||speaker||text) -> ts
+  recentText: new Map(), // text -> ts
+  lastByKey: new Map(), // key(origin||speaker) -> { idx, ts, text }
 };
 
 const TICK_DEDUPE_TTL_MS = 4500;
@@ -276,18 +299,15 @@ function joinTokensSmart(tokens) {
   for (const raw of tokens) {
     const t = normalizeSpace(raw);
     if (!t) continue;
-
     if (!out) {
       out = t;
       continue;
     }
-
     const prevWord = out.split(" ").slice(-1)[0] || "";
     if (isTinyToken(prevWord) && isTinyToken(t)) {
       out = out + t;
       continue;
     }
-
     out = (out + " " + t).replace(/\s+/g, " ").trim();
   }
   return out;
@@ -297,24 +317,8 @@ function looksLikeQuestion(s) {
   const t = normalizeSpace(s).toLowerCase();
   if (!t) return false;
   if (t.endsWith("?")) return true;
-
   return (
-    t.startsWith("como ") ||
-    t.startsWith("qual ") ||
-    t.startsWith("quais ") ||
-    t.startsWith("quando ") ||
-    t.startsWith("onde ") ||
-    t.startsWith("quem ") ||
-    t.startsWith("por que") ||
-    t.startsWith("porque") ||
-    t.startsWith("o que") ||
-    t.startsWith("oq ") ||
-    t.startsWith("me fale") ||
-    t.startsWith("fala ") ||
-    t.startsWith("pode ") ||
-    t.startsWith("consegue ") ||
-    t.startsWith("vc ") ||
-    t.startsWith("você ")
+    t.startsWith("como ")
   );
 }
 
@@ -341,8 +345,8 @@ function compactTranscriptLinesForLLM(lines, maxLines = 80) {
 
   for (const g of groups.values()) {
     const merged = joinTokensSmart(g.tokens);
-
     let final = merged;
+
     if (looksLikeQuestion(final) && !final.endsWith("?")) final += "?";
     if (!/[.!?]$/.test(final)) final += ".";
 
@@ -365,7 +369,6 @@ function compactTranscriptLinesForLLM(lines, maxLines = 80) {
   if (questions.length) {
     out += `\n\nPerguntas:\n` + questions.map((q) => `- ${q}`).join("\n");
   }
-
   return out.trim();
 }
 
@@ -384,10 +387,10 @@ async function loadStateFromStorage() {
     "activeMeetingTabId",
   ];
   const res = await chrome.storage.local.get(keys);
+
   if (res?.payload) state.payload = res.payload;
   if (typeof res?.suggestion === "string") state.suggestion = res.suggestion;
   if (typeof res?.suggestionAt === "string") state.suggestionAt = res.suggestionAt;
-
   if (typeof res?.rewriteText === "string") state.rewriteText = res.rewriteText;
   if (typeof res?.rewriteAt === "string") state.rewriteAt = res.rewriteAt;
 
@@ -440,6 +443,7 @@ async function callOpenAICompletion({
   targetTabId,
   uiAction = "suggestionChunk",
   slot = undefined,
+  signal = undefined,
 }) {
   const endpoint = (state.llamaSettings.endpoint || "https://api.openai.com/v1/chat/completions").trim();
   const model = state.llamaSettings.model || "gpt-4o-mini";
@@ -450,7 +454,13 @@ async function callOpenAICompletion({
 
   const body = { model, messages, stream: !!stream };
 
-  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
+
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
     throw new Error(`OpenAI error ${res.status}: ${errText || res.statusText}`);
@@ -472,21 +482,25 @@ async function callOpenAICompletion({
   }
 
   if (!res.body) throw new Error("OpenAI stream: missing body");
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
+
   let buf = "";
   let out = "";
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += decoder.decode(value, { stream: true });
 
+    buf += decoder.decode(value, { stream: true });
     const parts = buf.split(/\r?\n/);
     buf = parts.pop() || "";
+
     for (const line of parts) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("data:")) continue;
+
       const data = trimmed.slice(5).trim();
       if (!data || data === "[DONE]") continue;
 
@@ -509,7 +523,7 @@ async function callOpenAICompletion({
   return final;
 }
 
-async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAction = "suggestionChunk", slot }) {
+async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAction = "suggestionChunk", slot, signal }) {
   const base = (state.llamaSettings.endpoint || "http://localhost:11434").trim().replace(/\/+$/, "");
   const url = base.endsWith("/api/generate") ? base : base + "/api/generate";
   const model = state.llamaSettings.model || "llama3";
@@ -518,6 +532,7 @@ async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAc
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, prompt, stream: !!stream }),
+    signal,
   });
 
   if (!res.ok) {
@@ -540,18 +555,21 @@ async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAc
   }
 
   if (!res.body) throw new Error("Ollama stream: missing body");
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
+
   let buf = "";
   let out = "";
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buf += decoder.decode(value, { stream: true });
 
+    buf += decoder.decode(value, { stream: true });
     const lines = buf.split(/\r?\n/);
     buf = lines.pop() || "";
+
     for (const ln of lines) {
       const t = ln.trim();
       if (!t) continue;
@@ -576,8 +594,7 @@ async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAc
 /**
  * callPythonStream
  * - rewriteContext -> /ask
- * - suggestion -> /ask_me
- *
+ * - suggestion/replies -> /ask_me
  * ✅ suporta extraBody (ex: {route:"positivo"})
  */
 async function callPythonStream({
@@ -623,11 +640,13 @@ async function callPythonStream({
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
+
   let out = "";
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
+
     const chunk = decoder.decode(value, { stream: true });
     if (!chunk) continue;
 
@@ -649,11 +668,9 @@ async function callPythonStream({
 function buildSuggestionContentOnly({ forcedLine = "" } = {}) {
   const forced = String(forcedLine || "").trim();
   const consolidated = normalizeSpace(state.rewriteText || "");
-
   const last = state.payload?.latestLine ? String(state.payload.latestLine) : "";
   const historyTail = tailChars(state.payload?.fullHistory, 2000);
   const convTail = buildContextFromConversation(10);
-
   const contextBlock = forced || consolidated || convTail || last || historyTail || "";
   return String(contextBlock).trim();
 }
@@ -665,10 +682,8 @@ async function generateOneRoute({ route, prompt, requestId, targetTabId, signal 
   const mode = (state.llamaSettings.mode || "python").toLowerCase();
   const stream = true;
 
-  broadcastToUI(
-    { action: "suggestionChunk", slot: route, text: "", requestId, done: false, reset: true },
-    targetTabId
-  );
+  // reset slot
+  broadcastToUI({ action: "suggestionChunk", slot: route, text: "", requestId, done: false, reset: true }, targetTabId);
 
   if (mode === "python") {
     return await callPythonStream({
@@ -685,26 +700,12 @@ async function generateOneRoute({ route, prompt, requestId, targetTabId, signal 
 
   if (mode === "ollama") {
     const p = routeTaggedText(route, prompt);
-    return await callOllama({
-      prompt: p,
-      stream,
-      requestId,
-      targetTabId,
-      uiAction: "suggestionChunk",
-      slot: route,
-    });
+    return await callOllama({ prompt: p, stream, requestId, targetTabId, uiAction: "suggestionChunk", slot: route, signal });
   }
 
   const tagged = routeTaggedText(route, prompt);
   const messages = buildChatMessagesForOpenAI(tagged);
-  return await callOpenAICompletion({
-    messages,
-    stream,
-    requestId,
-    targetTabId,
-    uiAction: "suggestionChunk",
-    slot: route,
-  });
+  return await callOpenAICompletion({ messages, stream, requestId, targetTabId, uiAction: "suggestionChunk", slot: route, signal });
 }
 
 // =========================
@@ -729,11 +730,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           sendResponse({ status: "ok", via: "tab", reason: "sidePanel_unavailable" });
           return;
         }
-
         if (!tabId) {
           sendResponse({ status: "ok", via: "tab" });
           return;
         }
+
         try {
           await chrome.sidePanel.setOptions({ tabId, path: "viewer.html", enabled: true });
           await chrome.sidePanel.open({ tabId });
@@ -759,7 +760,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       if (action === "clearTranscriberState") {
+        // força abort total
         abortActiveStream();
+
         state.payload = null;
         state.suggestion = "";
         state.suggestionAt = "";
@@ -777,6 +780,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           { action: "transcriptDataUpdated", payload: { fullHistory: "", latestLine: "", timestamp: nowIso() } },
           state.activeMeetingTabId
         );
+
         broadcastToUI({ action: "suggestionChunk", text: "", done: true, reset: true, slot: "positivo" }, state.activeMeetingTabId);
         broadcastToUI({ action: "suggestionChunk", text: "", done: true, reset: true, slot: "negativo" }, state.activeMeetingTabId);
         broadcastToUI({ action: "rewriteChunk", text: "", done: true, reset: true }, state.activeMeetingTabId);
@@ -799,6 +803,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         const rawLine = request?.payload?.line;
         const parsed = parseTickLine(rawLine);
+
         if (!parsed) {
           sendResponse({ status: "ok", skipped: "unparsed" });
           return;
@@ -814,13 +819,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
 
         const ts = Date.parse(request?.payload?.timestamp || "") || Date.now();
-
         purgeOld(tickAgg.recent, TICK_DEDUPE_TTL_MS);
         purgeOld(tickAgg.recentText, TICK_DEDUPE_TTL_MS);
 
         // 1) dedupe exato
         const dedupeKey = `${origin}||${speaker}||${text}`;
         const prevExact = tickAgg.recent.get(dedupeKey);
+
         if (prevExact && ts - prevExact < TICK_DEDUPE_TTL_MS) {
           sendResponse({ status: "ok", skipped: "dedupe_exact" });
           return;
@@ -847,17 +852,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               speaker,
               text,
             };
+
             keepConversationTail(500);
 
             tickAgg.lastByKey.set(`${origin}||${speaker}`, { idx, ts, text });
             tickAgg.recentText.set(text, ts);
 
-            await chrome.storage.local.set({
-              conversation: state.conversation,
-              activeMeetingTabId: state.activeMeetingTabId,
-            });
-
+            await chrome.storage.local.set({ conversation: state.conversation, activeMeetingTabId: state.activeMeetingTabId });
             safeRuntimeSend({ action: "conversationUpdated" });
+
             sendResponse({ status: "ok", merged: "replace_unknown" });
             return;
           }
@@ -883,12 +886,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             tickAgg.lastByKey.set(key, { idx: last.idx, ts, text });
             tickAgg.recentText.set(text, ts);
 
-            await chrome.storage.local.set({
-              conversation: state.conversation,
-              activeMeetingTabId: state.activeMeetingTabId,
-            });
-
+            await chrome.storage.local.set({ conversation: state.conversation, activeMeetingTabId: state.activeMeetingTabId });
             safeRuntimeSend({ action: "conversationUpdated" });
+
             sendResponse({ status: "ok", merged: "extended" });
             return;
           }
@@ -913,17 +913,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           speaker,
           text,
         });
+
         keepConversationTail(500);
 
         tickAgg.lastByKey.set(key, { idx: state.conversation.length - 1, ts, text });
         tickAgg.recentText.set(text, ts);
 
-        await chrome.storage.local.set({
-          conversation: state.conversation,
-          activeMeetingTabId: state.activeMeetingTabId,
-        });
-
+        await chrome.storage.local.set({ conversation: state.conversation, activeMeetingTabId: state.activeMeetingTabId });
         safeRuntimeSend({ action: "conversationUpdated" });
+
         sendResponse({ status: "ok" });
         return;
       }
@@ -932,11 +930,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (typeof sender?.tab?.id === "number") state.activeMeetingTabId = sender.tab.id;
 
         state.payload = { ...request.payload, timestamp: nowIso() };
-
-        await chrome.storage.local.set({
-          payload: state.payload,
-          activeMeetingTabId: state.activeMeetingTabId,
-        });
+        await chrome.storage.local.set({ payload: state.payload, activeMeetingTabId: state.activeMeetingTabId });
 
         broadcastToUI({ action: "transcriptDataUpdated", payload: state.payload }, state.activeMeetingTabId);
         sendResponse({ status: "ok" });
@@ -965,7 +959,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             .filter(Boolean);
         }
 
-        abortActiveStream();
+        // ✅ abort apenas de rewrite anterior (não derruba suggest)
+        abortActiveStream("rewrite");
+        state.stream.kind = "rewrite";
+
         const abort = new AbortController();
         state.stream.abort = abort;
         state.stream.requestId = reqId;
@@ -980,6 +977,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const stream = true;
 
         let finalText = "";
+
         try {
           const prompt = String(compact || fallback || "").trim();
 
@@ -993,7 +991,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               path: PYTHON_PATH_REWRITE,
             });
           } else if (mode === "ollama") {
-            finalText = await callOllama({ prompt, stream, requestId: reqId, targetTabId, uiAction: "rewriteChunk" });
+            finalText = await callOllama({
+              prompt,
+              stream,
+              requestId: reqId,
+              targetTabId,
+              uiAction: "rewriteChunk",
+              signal: abort.signal,
+            });
           } else {
             const messages = buildChatMessagesForOpenAI(prompt);
             finalText = await callOpenAICompletion({
@@ -1002,9 +1007,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               requestId: reqId,
               targetTabId,
               uiAction: "rewriteChunk",
+              signal: abort.signal,
             });
           }
         } catch (e) {
+          // ✅ Abort não vira fallback nem erro
+          if (isAbortError(e)) {
+            sendResponse({ status: "ok", canceled: true, requestId: reqId });
+            return;
+          }
+
           console.warn("rewriteContext fallback:", e);
           finalText = stripMetaAnalysisText(fallback);
           broadcastToUI({ action: "rewriteChunk", text: finalText, requestId: reqId, done: true }, targetTabId);
@@ -1025,7 +1037,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const reqId = request?.payload?.requestId || makeRequestId();
         const targetTabId = resolveTargetTabId(sender);
 
-        abortActiveStream();
+        // ✅ abort apenas de suggest anterior (não derruba rewrite)
+        abortActiveStream("suggest");
+        state.stream.kind = "suggest";
+
         const abort = new AbortController();
         state.stream.abort = abort;
         state.stream.requestId = reqId;
@@ -1043,6 +1058,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const prompt = buildSuggestionContentOnly({ forcedLine });
 
         let finalText = "";
+
         if (mode === "python") {
           finalText = await callPythonStream({
             prompt,
@@ -1061,6 +1077,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             targetTabId,
             uiAction: "suggestionChunk",
             slot: "positivo",
+            signal: abort.signal,
           });
         } else {
           const messages = buildChatMessagesForOpenAI(prompt);
@@ -1071,6 +1088,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             targetTabId,
             uiAction: "suggestionChunk",
             slot: "positivo",
+            signal: abort.signal,
           });
         }
 
@@ -1090,6 +1108,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const targetTabId = resolveTargetTabId(sender);
 
         const text = String(request?.payload?.text || "").trim();
+
         const routes =
           Array.isArray(request?.payload?.routes) && request.payload.routes.length
             ? request.payload.routes
@@ -1097,7 +1116,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         const prompt = buildSuggestionContentOnly({ forcedLine: text });
 
-        abortActiveStream();
+        // ✅ abort apenas de suggest anterior (não derruba rewrite)
+        abortActiveStream("suggest");
+        state.stream.kind = "suggest";
+
         const abort = new AbortController();
         state.stream.abort = abort;
         state.stream.requestId = reqId;
@@ -1113,30 +1135,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         let negativo = "";
 
         const jobs = [];
-
         if (wantPos) {
           jobs.push(
-            generateOneRoute({
-              route: "positivo",
-              prompt,
-              requestId: reqId,
-              targetTabId,
-              signal: abort.signal,
-            }).then((t) => {
+            generateOneRoute({ route: "positivo", prompt, requestId: reqId, targetTabId, signal: abort.signal }).then((t) => {
               positivo = String(t || "").trim();
             })
           );
         }
-
         if (wantNeg) {
           jobs.push(
-            generateOneRoute({
-              route: "negativo",
-              prompt,
-              requestId: reqId,
-              targetTabId,
-              signal: abort.signal,
-            }).then((t) => {
+            generateOneRoute({ route: "negativo", prompt, requestId: reqId, targetTabId, signal: abort.signal }).then((t) => {
               negativo = String(t || "").trim();
             })
           );
@@ -1144,8 +1152,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         await Promise.all(jobs);
 
+        // ✅ backward/forward compatible
         sendResponse({
           status: "ok",
+          positivo,
+          negativo,
           suggestions: { positivo, negativo },
           timestamp: nowIso(),
           requestId: reqId,
@@ -1155,10 +1166,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       sendResponse({ status: "error", error: "Unknown action" });
     } catch (err) {
+      // ✅ AbortError é fluxo normal — não loga como erro, não suja UI
+      if (isAbortError(err)) {
+        try {
+          sendResponse({ status: "ok", canceled: true });
+        } catch {}
+        return;
+      }
+
       const msg = String(err?.message || err);
       console.error("❌ background error:", err);
 
-      const reqId = state.stream.requestId || null;
+      const reqId = request?.payload?.requestId || state.stream.requestId || null;
 
       broadcastToUI(
         { action: "suggestionChunk", slot: "positivo", text: state.stream.text || "", requestId: reqId, done: true, error: msg },
