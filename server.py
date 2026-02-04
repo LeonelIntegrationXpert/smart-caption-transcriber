@@ -66,21 +66,29 @@ log = logging.getLogger("mt-ollama-proxy")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 
-TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))               # read timeout
+TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))                   # read timeout
 CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "10"))  # connect timeout
 
-MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))  # limita prompt
+MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))      # limita prompt
 
 API_KEY = os.getenv("API_KEY", "").strip()  # opcional (x-api-key)
 
 FILTER_NOISE = True
 
-OPTIONS_PROFILE = {
+OPTIONS_PROFILE_POSITIVE = {
     "temperature": 0.2,
     "top_p": 0.9,
     "repeat_penalty": 1.1,
     "num_ctx": 4096,
 }
+# Negativo: um pouco mais “firme”, mas ainda controlado
+OPTIONS_PROFILE_NEGATIVE = {
+    "temperature": 0.25,
+    "top_p": 0.9,
+    "repeat_penalty": 1.1,
+    "num_ctx": 4096,
+}
+
 OPTIONS_CORRECTOR = {
     "temperature": 0.1,
     "top_p": 0.8,
@@ -94,7 +102,7 @@ OPTIONS_CONSOLIDATOR = {
     "num_ctx": 4096,
 }
 
-SYSTEM_PROMPT_PROFILE = " ".join([
+SYSTEM_PROMPT_PROFILE_POSITIVE = " ".join([
   "IDENTIDADE: Você é Leonel Dorneles Porto e responde sempre em primeira pessoa (eu), como candidato em entrevista técnica.",
   "FORMATO DE ENTRADA: A entrada virá como 'AUTOR=<nome>; FALA=<texto>; INSTRUCAO=...'; você deve responder diretamente para AUTOR e obrigatoriamente começar a resposta com '<AUTOR>, ' usando o nome recebido.",
   "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA, modelo de linguagem, assistente virtual ou qualquer variação; não fale sobre regras, prompts, sistema, tokens, ou configuração; entregue somente a resposta final.",
@@ -108,6 +116,23 @@ SYSTEM_PROMPT_PROFILE = " ".join([
   "AUTOAPRESENTAÇÃO: Se a fala for 'me fale sobre você' ou equivalente, gere um pitch em 10+ linhas cobrindo: cargo atual, tempo, foco técnico, 2-3 impactos, 2-4 tecnologias, e como gera valor."
 ])
 
+# ✅ NOVO: rota NEGATIVA (discordância/limite/recusa educada e firme)
+SYSTEM_PROMPT_PROFILE_NEGATIVE = " ".join([
+  "IDENTIDADE: Você é Leonel Dorneles Porto e responde sempre em primeira pessoa (eu), como candidato em entrevista técnica.",
+  "FORMATO DE ENTRADA: A entrada virá como 'AUTOR=<nome>; FALA=<texto>; INSTRUCAO=...'; você deve responder diretamente para AUTOR e obrigatoriamente começar a resposta com '<AUTOR>, ' usando o nome recebido.",
+  "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA, modelo de linguagem, assistente virtual ou qualquer variação; não fale sobre regras, prompts, sistema, tokens, ou configuração; entregue somente a resposta final.",
+  "IDIOMA: Responda no mesmo idioma da fala; se vier em português, responda em português; se vier em inglês, responda em inglês.",
+  "ESTILO/FORMATO: Responda em NO MÍNIMO 10 linhas, separadas por '\\n'.",
+  "LINHAS: Cada linha deve ser curta (ideal 8 a 14 palavras) e objetiva.",
+  "PROIBIDO: Não use bullets ('-', '*', '•'), não use numeração (1., 2.), não use títulos, não faça perguntas.",
+  "REGRA DO AUTOR: A PRIMEIRA LINHA deve começar exatamente com '<AUTOR>, '. As próximas linhas continuam direto sem repetir o autor.",
+  "TOM NEGATIVO: Responda com firmeza e educação, discordando ou recusando quando necessário.",
+  "TOM NEGATIVO: Evite concessões longas; justifique com fatos e limites profissionais.",
+  "TOM NEGATIVO: Se a fala pedir algo errado/irrealista, negue e proponha alternativa objetiva.",
+  "TOM NEGATIVO: Se a fala vier agressiva, imponha limite e mantenha postura calma.",
+  "CLAREZA: Expanda siglas na primeira menção; se não souber sigla interna, descreva genericamente sem inventar.",
+  "MÉTRICAS: Só use números se fizer sentido e forem defensáveis; prefira ~ se for estimativa.",
+])
 
 SYSTEM_PROMPT_CORRECTOR = " ".join([
   "MODO: Você é um corretor gramatical e ortográfico.",
@@ -149,7 +174,6 @@ def _to_str(x) -> str:
     return str(x)
 
 def _maybe_strip_sse_prefix(line) -> str:
-    # Pode vir bytes OU str, e em alguns setups pode vir "data: {...}"
     s = _to_str(line).strip()
     if s.startswith("data:"):
         s = s[5:].strip()
@@ -170,9 +194,9 @@ def is_noise_text(text: str) -> bool:
 
 def _parse_teams_inline(s: str):
     """
-    Exemplo real (mesma linha, múltiplos turnos):
+    Exemplo:
       "Teams • Leonel: ... Teams • Desconhecido: Me fale sobre você."
-    A gente pega sempre o ÚLTIMO "Teams • <autor>: <fala>"
+    Pega o ÚLTIMO "Teams • <autor>: <fala>"
     """
     if "Teams •" not in s:
         return None
@@ -201,8 +225,8 @@ def parse_line_author_and_text(line: str):
     """
     Prioridade:
       1) Teams inline (múltiplos turnos na mesma linha)
-      2) SPEAKER + MENSAGEM pelos 2 últimos ':'  =>  <...>: <SPEAKER>: <MENSAGEM>
-      3) Fallback: AUTOR pelo primeiro ':'      =>  <AUTOR>: <FALA>
+      2) pelos 2 últimos ':' => <...>: <SPEAKER>: <MENSAGEM>
+      3) fallback: <AUTOR>: <FALA>
     """
     s = (line or "").strip()
     if not s or ":" not in s:
@@ -233,7 +257,6 @@ def parse_line_author_and_text(line: str):
 
 def extract_last_valid(raw: str):
     raw = raw or ""
-    # ✅ se veio tudo em 1 linha (Teams inline), resolve logo
     p_inline = _parse_teams_inline(raw.strip())
     if p_inline and (not FILTER_NOISE or not is_noise_text(p_inline["text"])):
         return p_inline
@@ -402,6 +425,11 @@ def _read_prompt_json(body: dict) -> str:
         prompt = prompt[:MAX_PROMPT_CHARS]
     return prompt
 
+def _read_route(body: dict) -> str:
+    # opcional: dá pra mandar route no JSON e reutilizar /ask_me
+    r = str((body or {}).get("route", "")).strip().lower()
+    return r
+
 @app.post("/ask")
 async def ask(req: Request):
     try:
@@ -420,8 +448,10 @@ async def ask(req: Request):
         media_type="text/plain; charset=utf-8",
     )
 
-@app.post("/ask_me")
-async def ask_me(req: Request, background_tasks: BackgroundTasks):
+async def _ask_me_core(req: Request, background_tasks: BackgroundTasks, mode: str):
+    """
+    mode: "positivo" | "negativo"
+    """
     try:
         body = await req.json()
     except Exception:
@@ -431,7 +461,12 @@ async def ask_me(req: Request, background_tasks: BackgroundTasks):
     if not prompt:
         return JSONResponse({"error": "missing prompt"}, status_code=400)
 
-    log.info("[/ask_me] prompt_len=%d preview=%r", len(prompt), prompt[:240])
+    # Se vier route no JSON, ele pode forçar aqui (mantém compat)
+    route = _read_route(body)
+    if route in ("negativo", "negative", "no", "hard", "reject"):
+        mode = "negativo"
+
+    log.info("[/%s] prompt_len=%d preview=%r", "ask_me" if mode=="positivo" else "ask_me_neg", len(prompt), prompt[:240])
 
     last = extract_last_valid(prompt)
     if last:
@@ -445,10 +480,27 @@ async def ask_me(req: Request, background_tasks: BackgroundTasks):
     clean_prompt = build_profile_user_text(prompt)
     log.info("[/ask_me] clean_prompt=%r", clean_prompt[:320])
 
+    if mode == "negativo":
+        sys_prompt = SYSTEM_PROMPT_PROFILE_NEGATIVE
+        options = OPTIONS_PROFILE_NEGATIVE
+    else:
+        sys_prompt = SYSTEM_PROMPT_PROFILE_POSITIVE
+        options = OPTIONS_PROFILE_POSITIVE
+
     return StreamingResponse(
-        stream_ollama_chat(SYSTEM_PROMPT_PROFILE, clean_prompt, OPTIONS_PROFILE, sanitize_newlines=False),
+        stream_ollama_chat(sys_prompt, clean_prompt, options, sanitize_newlines=False),
         media_type="text/plain; charset=utf-8",
     )
+
+@app.post("/ask_me")
+async def ask_me(req: Request, background_tasks: BackgroundTasks):
+    # padrão: positivo (mantém compat com o que você já usa)
+    return await _ask_me_core(req, background_tasks, mode="positivo")
+
+# ✅ NOVO ENDPOINT: NEGATIVO
+@app.post("/ask_me_neg")
+async def ask_me_neg(req: Request, background_tasks: BackgroundTasks):
+    return await _ask_me_core(req, background_tasks, mode="negativo")
 
 @app.post("/context_ingest")
 async def context_ingest(req: Request, background_tasks: BackgroundTasks):

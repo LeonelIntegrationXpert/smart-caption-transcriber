@@ -5,6 +5,7 @@
  * - FIX: AbortError (DOMException) não vira erro
  * - FIX: rewrite não é abortado por suggest/replies (stream.kind)
  * - FIX: generateReplies retorna {positivo, negativo} top-level + suggestions
+ * - NEW: rota python NEGATIVA usa endpoint dedicado /ask_me_neg
  */
 "use strict";
 
@@ -13,7 +14,8 @@ const G = globalThis;
 
 const DEFAULT_PYTHON_BASE_URL = "http://localhost:8000";
 const PYTHON_PATH_REWRITE = "/ask";
-const PYTHON_PATH_SUGGEST = "/ask_me";
+const PYTHON_PATH_SUGGEST_POS = "/ask_me";
+const PYTHON_PATH_SUGGEST_NEG = "/ask_me_neg";
 
 const state = {
   payload: null, // { fullHistory, latestLine, timestamp }
@@ -144,8 +146,10 @@ function normalizePythonEndpoint(baseOrFull, path, defaultBase = DEFAULT_PYTHON_
 
   const cleaned = raw.replace(/\/+$/, "");
 
-  if (/\b\/ask_me\b/i.test(cleaned) || /\b\/ask\b/i.test(cleaned)) {
+  // ✅ agora cobre /ask_me_neg também
+  if (/\b\/ask_me_neg\b/i.test(cleaned) || /\b\/ask_me\b/i.test(cleaned) || /\b\/ask\b/i.test(cleaned)) {
     const swapped = cleaned
+      .replace(/\/ask_me_neg\b/gi, desiredPath)
       .replace(/\/ask_me\b/gi, desiredPath)
       .replace(/\/ask\b/gi, desiredPath);
     return swapped;
@@ -317,9 +321,7 @@ function looksLikeQuestion(s) {
   const t = normalizeSpace(s).toLowerCase();
   if (!t) return false;
   if (t.endsWith("?")) return true;
-  return (
-    t.startsWith("como ")
-  );
+  return t.startsWith("como ");
 }
 
 function compactTranscriptLinesForLLM(lines, maxLines = 80) {
@@ -594,7 +596,7 @@ async function callOllama({ prompt, stream = false, requestId, targetTabId, uiAc
 /**
  * callPythonStream
  * - rewriteContext -> /ask
- * - suggestion/replies -> /ask_me
+ * - suggestion/replies -> /ask_me | /ask_me_neg
  * ✅ suporta extraBody (ex: {route:"positivo"})
  */
 async function callPythonStream({
@@ -686,15 +688,16 @@ async function generateOneRoute({ route, prompt, requestId, targetTabId, signal 
   broadcastToUI({ action: "suggestionChunk", slot: route, text: "", requestId, done: false, reset: true }, targetTabId);
 
   if (mode === "python") {
+    const path = String(route).toLowerCase() === "negativo" ? PYTHON_PATH_SUGGEST_NEG : PYTHON_PATH_SUGGEST_POS;
     return await callPythonStream({
       prompt,
       requestId,
       targetTabId,
       signal,
       uiAction: "suggestionChunk",
-      path: PYTHON_PATH_SUGGEST,
+      path,
       slot: route,
-      extraBody: { route },
+      extraBody: { route }, // ok manter (log/telemetria / compat)
     });
   }
 
@@ -1066,8 +1069,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             targetTabId,
             signal: abort.signal,
             uiAction: "suggestionChunk",
-            path: PYTHON_PATH_SUGGEST,
+            path: PYTHON_PATH_SUGGEST_POS,
             slot: "positivo",
+            extraBody: { route: "positivo" },
           });
         } else if (mode === "ollama") {
           finalText = await callOllama({

@@ -3,20 +3,20 @@
    - Mostra histórico + sugestões em painel lateral in-page
    - ✅ Auto-IA: depois de 1s sem novas linhas, manda o “tail” do chat pra IA
    - ✅ Respostas: 2 caminhos -> POSITIVO e NEGATIVO
-   - ✅ FIX: anti-duplicação de requests (manual + auto + double-click + frames)
+   - ✅ FIX: anti-duplicação de requests (manual + auto + frames)
    - ✅ FIX: ACK/streaming compatível (não exige res.status === "ok")
-   - ✅ NEW: Teams RTT não gera “pipocos” (buffer + commit por idle/pontuação)
+   - ✅ NEW: Teams RTT anti “pipoco” (buffer + commit por idle/pontuação)
    - ✅ NEW: “Responder (2)” em Teams roda rewrite antes (gera bloco corrigido)
    - ✅ NEW: Bloco corrigido (IA) visível no painel + botão copiar (só Autor: mensagem)
-   - ✅ NEW: Teams "." final NÃO vira linha nova (cola no final da última)
-   - ✅ NEW: Flags ✅ nas linhas arrumadas (pra não corrigir toda hora)
+   - ✅ NEW: Teams "." final NÃO vira linha nova (cola na última)
+   - ✅ NEW: Flags ✅ nas linhas arrumadas
    - ✅ FIX: rewrite NÃO reenvia linhas já corrigidas (chunk unfixed)
    - ✅ FIX: painel SEMPRE mostra só "Autor: mensagem" (não mostra origin)
    - ✅ FIX: merge do “pipoco” aplica no histórico ANTES do rewrite (segment match)
-   - ✅ FIX: dedupe do painel por match exato (não por substring)
+   - ✅ FIX: dedupe do painel por match EXATO (não substring)
    - ✅ FIX: “OK verdinho” não fica preso (watchdog de lock)
    - ✅ NEW: RETRY/LOOP — enquanto existir bloco Teams NÃO corrigido no tail, continua tentando corrigir
-   - ✅ FIX NOVO: Teams eco/acúmulo de mensagem (delta-guard + collapse repeats)
+   - ✅ FIX NOVO: Teams eco/acúmulo (delta-guard + collapse repeats)
 */
 
 "use strict";
@@ -32,17 +32,26 @@ const REWRITE_RETRY_JITTER_MS = 120;
 
 function parseRewriteResponse(res) {
   if (!res || typeof res !== "object") return null;
+
   const text = String(res.text || "").trim();
   const lines = Array.isArray(res.lines)
     ? res.lines.map((s) => String(s || "").trim()).filter(Boolean)
     : null;
 
   let outLines = lines;
+
+  // fallback: tenta extrair linhas do texto quando vier em bloco
   if ((!outLines || !outLines.length) && text) {
-    const parts = text.split("\n").map((s) => s.trim()).filter(Boolean);
+    const parts = text
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    // “Origin: Speaker: Text” => tem pelo menos 2 “:”
     const good = parts.filter((s) => (s.match(/:/g) || []).length >= 2);
     if (good.length) outLines = good;
   }
+
   if ((outLines && outLines.length) || text) return { text, lines: outLines };
   return null;
 }
@@ -62,15 +71,12 @@ function requestRewriteContextWithRetries(lines, cb) {
   rewriteInFlight = true;
 
   const maxAttempts = 1 + Math.max(0, REWRITE_RETRY_MAX | 0);
+
   const sendAttempt = (attempt) => {
     safeSendMessage(
       {
         action: "rewriteContext",
-        payload: {
-          lines: merged,
-          wantLines: true,
-          fmt: "origin:speaker:text",
-        },
+        payload: { lines: merged, wantLines: true, fmt: "origin:speaker:text" },
       },
       (res) => {
         const le = chrome.runtime?.lastError?.message;
@@ -83,7 +89,8 @@ function requestRewriteContextWithRetries(lines, cb) {
 
         if (attempt + 1 < maxAttempts) {
           const delay = Math.round(
-            REWRITE_RETRY_BASE_DELAY_MS * Math.pow(REWRITE_RETRY_BACKOFF, attempt) +
+            REWRITE_RETRY_BASE_DELAY_MS *
+              Math.pow(REWRITE_RETRY_BACKOFF, attempt) +
               Math.random() * REWRITE_RETRY_JITTER_MS
           );
           return setTimeout(() => sendAttempt(attempt + 1), delay);
@@ -144,24 +151,20 @@ const UI_IDS = {
   style: "__mt_style",
   overlay: "__mt_dim_overlay",
   bubble: "__mt_launcher_bubble",
-
   panel: "__mt_side_panel",
   panelHeader: "__mt_side_panel_header",
   panelClose: "__mt_side_panel_close",
   panelOpenTab: "__mt_side_panel_open_tab",
   panelStatus: "__mt_side_panel_status",
   panelTranscript: "__mt_side_panel_transcript",
-
   // suggestions (2 rotas)
   panelSuggestionsWrap: "__mt_side_panel_suggestions_wrap",
   panelSuggestionPos: "__mt_side_panel_suggestion_pos",
   panelSuggestionNeg: "__mt_side_panel_suggestion_neg",
   panelSugCopyPos: "__mt_side_panel_copy_pos",
   panelSugCopyNeg: "__mt_side_panel_copy_neg",
-
   // auto toggle
   panelAutoIaBtn: "__mt_side_panel_auto_ia_btn",
-
   // ✅ bloco corrigido
   panelFixedBlock: "__mt_fixed_block",
   panelFixedCopy: "__mt_fixed_copy",
@@ -173,102 +176,16 @@ const UI_IDS = {
 let transcriptData = "";
 let lastSavedHash = "";
 
-// ✅ FIX: agora o “prevLine” é por origin+speaker (não só speaker)
+// ✅ FIX: “prevLine” por origin+speaker
 let lastLineByKey = new Map(); // key(origin::speaker) -> last full text
-
 let seenKeys = new Set();
-let latestBySpeaker = new Map();
 
-// ✅ Guarda a última linha “singleLine” por origin+speaker (pra colar "." no final)
-let lastSingleLineByKey = new Map();
+let latestBySpeaker = new Map(); // speaker -> aggregated
+let lastSingleLineByKey = new Map(); // origin::speaker -> last singleLine
 
 // =====================================================
 // Utils
 // =====================================================
-function extractTaggedLines(rewritten, expectedCount) {
-  const raw = Array.isArray(rewritten) ? rewritten.join("\n") : String(rewritten || "");
-  if (!/⟦L\d{2}⟧/u.test(raw)) return null;
-
-  const map = new Array(expectedCount).fill(null);
-  const re = /⟦L(\d{2})⟧\s*([\s\S]*?)(?=⟦L\d{2}⟧|$)/gu;
-  let m;
-  while ((m = re.exec(raw)) !== null) {
-    const idx = parseInt(m[1], 10) - 1;
-    if (idx < 0 || idx >= expectedCount) continue;
-    map[idx] = String(m[2] || "").trim();
-  }
-  if (map.some((x) => !x)) return null;
-  return map;
-}
-
-function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOrText) {
-  const rawSeg = (rawSegmentLines || [])
-    .map((s) => String(s || "").trim())
-    .filter(Boolean);
-  if (!rawSeg.length) return null;
-
-  // parse do raw (fonte da verdade p/ origin + speaker)
-  const rawP = rawSeg.map((ln) => {
-    const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
-    const p = parseTranscriptLine(probe);
-    return {
-      origin: String(p.origin || "").trim() || "Teams",
-      speaker: String(p.speaker || "").trim() || "Desconhecido",
-      text: String(p.text || "").trim(),
-    };
-  });
-
-  const expected = rawP.length;
-  const tagged = extractTaggedLines(rewrittenLinesOrText, expected);
-  if (tagged) rewrittenLinesOrText = tagged;
-
-  let outLines = Array.isArray(rewrittenLinesOrText)
-    ? rewrittenLinesOrText
-    : String(rewrittenLinesOrText || "").split("\n");
-
-  outLines = outLines.map((s) => String(s || "").trim()).filter(Boolean);
-  if (!outLines.length) return null;
-
-  const expanded = [];
-  for (const ln of outLines) {
-    const turns = splitTeamsInlineTurns(ln);
-    if (turns && turns.length) {
-      for (const t of turns) expanded.push(`Teams: ${t.speaker}: ${t.text}`);
-    } else {
-      expanded.push(ln);
-    }
-  }
-  outLines = expanded;
-
-  if (outLines.length !== rawP.length) return null;
-
-  const safe = [];
-  for (let i = 0; i < rawP.length; i++) {
-    const src = rawP[i];
-    const ln = outLines[i];
-
-    const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
-    const p = parseTranscriptLine(probe);
-
-    let newText = "";
-    if (p && p.text) newText = p.text;
-    else {
-      const m = String(ln).match(/^([^:]{1,80})\s*:\s*(.+)$/u);
-      newText = m ? m[2] : ln;
-    }
-
-    newText = normalizeSpacesOneLine(newText);
-
-    // Se ainda veio “Teams • ...” dentro do texto, é sinal de colagem -> aborta
-    if (/Teams\s*[•·-]/i.test(newText)) return null;
-
-    if (!newText) newText = src.text || "";
-    safe.push(`${src.origin}: ${src.speaker}: ${newText}`);
-  }
-
-  return safe.length ? safe : null;
-}
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -284,26 +201,7 @@ function trimHistoryIfNeeded() {
   transcriptData = transcriptData.slice(transcriptData.length - MAX_HISTORY_CHARS);
 }
 
-// =====================================================
-// ✅ Capture dedupe por DOM node (evita reler o mesmo caption)
-// =====================================================
-const _nodeLastCaptured = new WeakMap();
-
-function appendOncePerNode(node, speaker, text, origin) {
-  const sp = normalizeSpacesOneLine(speaker || "");
-  const tx = normalizeSpacesOneLine(text || "");
-  if (!tx) return;
-
-  const sig = `${sp}||${tx}`;
-  if (node) {
-    const prev = _nodeLastCaptured.get(node);
-    if (prev === sig) return;
-    _nodeLastCaptured.set(node, sig);
-  }
-  appendNewTranscript(sp, tx, origin);
-}
-
-// ✅ sempre 1 linha, espaços normalizados
+// ✅ sempre 1 linha
 function normalizeSpacesOneLine(s) {
   return String(s || "")
     .replace(/\u00A0/g, " ")
@@ -347,14 +245,13 @@ function hasFinalPunct(s) {
   const t = String(s || "").trim();
   return /[.!?…]$/.test(t);
 }
-
 function isOnlyPunctDelta(s) {
   const t = String(s || "").trim();
   return /^[.!?…]+$/.test(t);
 }
 
 // =====================================================
-// ✅ "EU" (normalizado) — evita variações tipo "(Você)"
+// ✅ "EU" (normalizado)
 // =====================================================
 function normName(s) {
   return String(s || "")
@@ -370,13 +267,12 @@ function addMyName(name) {
   const n = normName(name);
   if (n) myKnownNameNorms.add(n);
 }
-
 function isMe(name) {
   return myKnownNameNorms.has(normName(name));
 }
 
 // =====================================================
-// ✅ Flags: linhas já “arrumadas” (pra não ficar corrigindo toda hora)
+// ✅ Flags: linhas já “arrumadas”
 // =====================================================
 const FIXED_FLAGS_STORE_KEY = "__mt_fixed_line_flags_v1";
 const FIXED_FLAGS_MAX = 2500;
@@ -392,87 +288,54 @@ function normTextKey(s) {
     .trim();
 }
 
-// =====================================================
-// ✅ Teams: colapsa repetição absurda (evita eco/acúmulo)
-// =====================================================
-function collapseTeamsRepeats(text) {
-  let s = normalizeSpacesOneLine(text);
-  if (s.length < 64) return s;
-
-  // 1) colapsa repetição TOTAL por palavras (mesma frase repetida k vezes)
-  const words = s.split(" ").filter(Boolean);
-  if (words.length >= 12) {
-    for (let rep = 6; rep >= 2; rep--) {
-      if (words.length % rep !== 0) continue;
-      const patLen = words.length / rep;
-      if (patLen < 6) continue;
-
-      const pat = words.slice(0, patLen).join(" ");
-      let ok = true;
-      for (let r = 1; r < rep; r++) {
-        const seg = words.slice(r * patLen, (r + 1) * patLen).join(" ");
-        if (seg !== pat) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) return pat;
-    }
+function fastHash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
   }
+  return String(h >>> 0);
+}
 
-  // 2) por sentenças (remove duplicadas consecutivas e grupos repetidos)
-  const segsRaw = s.match(/[^.!?…]+[.!?…]*/g) || [];
-  const segs = segsRaw.map((x) => normalizeSpacesOneLine(x)).filter(Boolean);
+function lineFlagKey(line) {
+  const clean = normTextKey(String(line || "").replace(/^🎤\s*/u, "").trim());
+  return clean ? fastHash(clean) : "";
+}
 
-  if (segs.length >= 2) {
-    const canon = (x) =>
-      normTextKey(String(x || "").replace(/[.!?…,"'“”‘’]/g, " "));
+function loadFixedFlags() {
+  if (fixedFlagsLoaded) return;
+  fixedFlagsLoaded = true;
 
-    // remove duplicadas consecutivas
-    const compact = [];
-    for (const seg of segs) {
-      const c = canon(seg);
-      const last = compact.length ? canon(compact[compact.length - 1]) : "";
-      if (c && last && c === last) continue;
-      compact.push(seg);
+  try {
+    const raw = localStorage.getItem(FIXED_FLAGS_STORE_KEY);
+    if (!raw) return;
+
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return;
+
+    fixedLineFlags.clear();
+    for (const it of arr) {
+      if (!it) continue;
+      const k = String(it[0] || "").trim();
+      const ts = Number(it[1] || 0) || 0;
+      if (!k) continue;
+      fixedLineFlags.set(k, ts || Date.now());
+      if (fixedLineFlags.size >= FIXED_FLAGS_MAX) break;
     }
+  } catch {}
+}
 
-    const cArr = compact.map(canon);
-
-    // detecta grupo repetido
-    for (let gl = 1; gl <= Math.floor(compact.length / 2); gl++) {
-      if (compact.length % gl !== 0) continue;
-      let ok = true;
-      for (let i = 0; i < cArr.length; i++) {
-        if (cArr[i] !== cArr[i % gl]) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) {
-        return normalizeSpacesOneLine(compact.slice(0, gl).join(" "));
-      }
-    }
-
-    return normalizeSpacesOneLine(compact.join(" "));
-  }
-
-  // 3) fallback: remove repetição de palavra
-  const out = [];
-  let last = "";
-  let run = 0;
-  for (const w of words) {
-    const c = w.toLowerCase();
-    if (c === last) {
-      run++;
-      if (run >= 2) continue; // deixa no máx 2
-    } else {
-      run = 0;
-      last = c;
-    }
-    out.push(w);
-  }
-  return out.join(" ");
+function scheduleSaveFixedFlags() {
+  try {
+    if (fixedFlagsSaveTimer) clearTimeout(fixedFlagsSaveTimer);
+    fixedFlagsSaveTimer = setTimeout(() => {
+      fixedFlagsSaveTimer = null;
+      try {
+        const arr = Array.from(fixedLineFlags.entries()).slice(-FIXED_FLAGS_MAX);
+        localStorage.setItem(FIXED_FLAGS_STORE_KEY, JSON.stringify(arr));
+      } catch {}
+    }, 400);
+  } catch {}
 }
 
 // =====================================================
@@ -498,7 +361,6 @@ function rememberFixedText(line) {
 
   const arr = recentFixedTextBySpeaker.get(k) || [];
   const keep = arr.filter((it) => it && it.ts >= cutoff && it.t);
-
   if (!keep.some((it) => it.t === t)) keep.push({ t, ts: now });
 
   recentFixedTextBySpeaker.set(k, keep.slice(-120));
@@ -531,68 +393,21 @@ function isRecentlyFixedText(origin, speaker, text) {
   return false;
 }
 
-function fastHash(str) {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return String(h >>> 0);
-}
-
-function lineFlagKey(line) {
-  const clean = normTextKey(String(line || "").replace(/^🎤\s*/u, "").trim());
-  return clean ? fastHash(clean) : "";
-}
-
-function loadFixedFlags() {
-  if (fixedFlagsLoaded) return;
-  fixedFlagsLoaded = true;
-  try {
-    const raw = localStorage.getItem(FIXED_FLAGS_STORE_KEY);
-    if (!raw) return;
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return;
-
-    fixedLineFlags.clear();
-    for (const it of arr) {
-      if (!it) continue;
-      const k = String(it[0] || "").trim();
-      const ts = Number(it[1] || 0) || 0;
-      if (!k) continue;
-      fixedLineFlags.set(k, ts || Date.now());
-      if (fixedLineFlags.size >= FIXED_FLAGS_MAX) break;
-    }
-  } catch {}
-}
-
-function scheduleSaveFixedFlags() {
-  try {
-    if (fixedFlagsSaveTimer) clearTimeout(fixedFlagsSaveTimer);
-    fixedFlagsSaveTimer = setTimeout(() => {
-      fixedFlagsSaveTimer = null;
-      try {
-        const arr = Array.from(fixedLineFlags.entries()).slice(-FIXED_FLAGS_MAX);
-        localStorage.setItem(FIXED_FLAGS_STORE_KEY, JSON.stringify(arr));
-      } catch {}
-    }, 400);
-  } catch {}
-}
-
 function markLineFixed(line) {
   loadFixedFlags();
   const k = lineFlagKey(line);
   if (!k) return;
+
   fixedLineFlags.delete(k);
   fixedLineFlags.set(k, Date.now());
+
   while (fixedLineFlags.size > FIXED_FLAGS_MAX) {
     const first = fixedLineFlags.keys().next().value;
     if (!first) break;
     fixedLineFlags.delete(first);
   }
-  scheduleSaveFixedFlags();
 
-  // ✅ registra texto corrigido pra suppress
+  scheduleSaveFixedFlags();
   rememberFixedText(line);
 }
 
@@ -603,28 +418,106 @@ function isLineFixed(line) {
 }
 
 // =====================================================
-// ✅ Dedupe curto por texto (evita "Desconhecido" duplicar "Leonel")
+// ✅ Teams: colapsa repetição absurda (eco/acúmulo)
+// =====================================================
+function collapseTeamsRepeats(text) {
+  let s = normalizeSpacesOneLine(text);
+  if (s.length < 64) return s;
+
+  // 1) repetição total por palavras (mesma frase repetida k vezes)
+  const words = s.split(" ").filter(Boolean);
+  if (words.length >= 12) {
+    for (let rep = 6; rep >= 2; rep--) {
+      if (words.length % rep !== 0) continue;
+      const patLen = words.length / rep;
+      if (patLen < 6) continue;
+
+      const pat = words.slice(0, patLen).join(" ");
+      let ok = true;
+
+      for (let r = 1; r < rep; r++) {
+        const seg = words.slice(r * patLen, (r + 1) * patLen).join(" ");
+        if (seg !== pat) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return pat;
+    }
+  }
+
+  // 2) por sentenças
+  const segsRaw = s.match(/[^.!?…]+[.!?…]*/g) || [];
+  const segs = segsRaw.map((x) => normalizeSpacesOneLine(x)).filter(Boolean);
+  if (segs.length >= 2) {
+    const canon = (x) =>
+      normTextKey(String(x || "").replace(/[.!?…,"'“”‘’]/g, " "));
+
+    // remove duplicadas consecutivas
+    const compact = [];
+    for (const seg of segs) {
+      const c = canon(seg);
+      const last = compact.length ? canon(compact[compact.length - 1]) : "";
+      if (c && last && c === last) continue;
+      compact.push(seg);
+    }
+
+    const cArr = compact.map(canon);
+
+    // detecta grupo repetido
+    for (let gl = 1; gl <= Math.floor(compact.length / 2); gl++) {
+      if (compact.length % gl !== 0) continue;
+      let ok = true;
+      for (let i = 0; i < cArr.length; i++) {
+        if (cArr[i] !== cArr[i % gl]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return normalizeSpacesOneLine(compact.slice(0, gl).join(" "));
+    }
+
+    return normalizeSpacesOneLine(compact.join(" "));
+  }
+
+  // 3) fallback: remove repetição de palavra (máx 2 iguais seguidas)
+  const out = [];
+  let last = "";
+  let run = 0;
+  for (const w of words) {
+    const c = w.toLowerCase();
+    if (c === last) {
+      run++;
+      if (run >= 2) continue;
+    } else {
+      run = 0;
+      last = c;
+    }
+    out.push(w);
+  }
+  return out.join(" ");
+}
+
+// =====================================================
+// ✅ Dedupe curto por texto
 // =====================================================
 const TEXT_DEDUP_MS = 1600;
-const recentText = new Map(); // key -> { ts, speaker, line }
+const recentText = new Map(); // key(origin||text) -> { ts, speaker, line }
 
 function isUnknownSpeaker(s) {
   const t = String(s || "").trim().toLowerCase();
   return !t || t === "desconhecido" || t === "unknown";
 }
 
-// =====================================================
-// ✅ Speaker fallback (não inventa “Entrevistador”)
-// =====================================================
 const UNKNOWN_SPEAKER_LABEL = "Desconhecido";
 const SINGLE_SPEAKER_GUESS_UNKNOWN = true;
 const SINGLE_SPEAKER_GUESS_WINDOW_MS = 120000;
-
 let recentNonUnknownSpeakers = new Map(); // norm -> { name, ts }
 
 function noteNonUnknownSpeaker(name) {
   const n = normName(name);
   if (!n) return;
+
   const now = Date.now();
   recentNonUnknownSpeakers.set(n, { name: String(name || "").trim(), ts: now });
 
@@ -649,14 +542,14 @@ function guessSpeakerIfUnknown(speaker) {
     if (!uniq.some((x) => normName(x.name) === nn)) uniq.push(v);
   }
   if (uniq.length === 1) return uniq[0].name;
+
   return speaker;
 }
 
 // =====================================================
-// ✅ Panel transcript dedupe por match EXATO (não substring)
+// ✅ Panel transcript dedupe por match EXATO
 // =====================================================
 let panelTranscriptCache = "";
-let panelSuggestionCache = { positivo: "", negativo: "" };
 let panelFixedBlockCache = "";
 let panelLineSet = new Set();
 
@@ -678,6 +571,9 @@ function normalizeTranscriptLineForLLM(line) {
   return String(line || "").replace(/^🎤\s*/u, "").trim();
 }
 
+// =====================================================
+// ✅ Replace helper
+// =====================================================
 function replaceLastLineInCaches(oldLine, newLine) {
   if (!oldLine || !newLine || oldLine === newLine) return;
 
@@ -724,8 +620,7 @@ try {
 // ✅ FIX: Anti-duplicação de requests (manual + auto + frames)
 // =====================================================
 const AI_ONLY_TOP_FRAME = true;
-const ENABLE_TWO_CALL_FALLBACK = false;
-
+const ENABLE_TWO_CALL_FALLBACK = false; // deixa OFF (limpo)
 const REPLY_DEDUP_MS = 1800;
 const REPLY_LOCK_MS = 2500;
 const STREAM_LOCK_BUMP_MS = 1200;
@@ -756,6 +651,7 @@ function bumpReplyLock(ms = STREAM_LOCK_BUMP_MS) {
 
 function tryAcquireReplyLock(payloadStr) {
   if (!aiAllowedHere()) return { ok: false, reason: "not_top_frame" };
+
   releaseReplyLockIfExpired();
 
   const now = Date.now();
@@ -773,8 +669,10 @@ function tryAcquireReplyLock(payloadStr) {
 
   lastReplyKey = key;
   lastReplyAt = now;
+
   repliesInFlight = true;
   repliesLockUntil = now + REPLY_LOCK_MS;
+
   return { ok: true, key };
 }
 
@@ -793,6 +691,7 @@ function stopTranscriber(reason) {
   if (startTimeoutId) clearTimeout(startTimeoutId);
   if (flushDebounceId) clearTimeout(flushDebounceId);
   cancelAutoIaTimer();
+
   if (teamsRttTimerId) {
     clearInterval(teamsRttTimerId);
     teamsRttTimerId = null;
@@ -809,6 +708,7 @@ function stopTranscriber(reason) {
 
 function safeSendMessage(message, cb) {
   if (extensionInvalidated) return;
+
   try {
     chrome.runtime.sendMessage(message, cb);
   } catch (err) {
@@ -854,6 +754,7 @@ function setPanelStatus(msg) {
 function copyToClipboard(text) {
   const t = String(text || "").trim();
   if (!t) return;
+
   try {
     navigator.clipboard?.writeText(t);
     setPanelStatus("Copiado ✅");
@@ -869,26 +770,292 @@ function copyToClipboard(text) {
 }
 
 // =====================================================
-// Suggestions UI (2 slots)
+// ✅ Suggestions UI (2 slots) — HISTÓRICO colapsável (não sobrescreve)
 // =====================================================
-function setAllSuggestionSlots(value) {
-  setSuggestionSlot("positivo", value);
-  setSuggestionSlot("negativo", value);
-}
+const SUG_HISTORY_STORE_KEY = "__mt_sug_history_v1";
+const SUG_HISTORY_MAX = 40;
 
-function setSuggestionSlot(slot, raw) {
-  slot = slot === "negativo" ? "negativo" : "positivo";
-  panelSuggestionCache[slot] = tail(String(raw || ""), 8000);
-  const el = document.getElementById(
+let __sugSeq = 0;
+
+const sugState = {
+  positivo: { items: [], openId: null, liveId: null },
+  negativo: { items: [], openId: null, liveId: null },
+};
+
+function sugSlotNorm(slot) {
+  return slot === "negativo" ? "negativo" : "positivo";
+}
+function sugId() {
+  __sugSeq = (__sugSeq + 1) | 0;
+  return `s${Date.now()}_${__sugSeq}`;
+}
+function sugTimeLabel(ts) {
+  try {
+    const d = new Date(ts);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${hh}:${mm}:${ss}`;
+  } catch {
+    return "";
+  }
+}
+function sugHost(slot) {
+  slot = sugSlotNorm(slot);
+  return document.getElementById(
     slot === "positivo" ? UI_IDS.panelSuggestionPos : UI_IDS.panelSuggestionNeg
   );
-  if (!el) return;
+}
 
-  const label = slot === "positivo" ? "Positivo" : "Negativo";
-  const txt = panelSuggestionCache[slot]
-    ? `${label}:\n${panelSuggestionCache[slot]}`
-    : `${label}: (vazio)`;
-  setTextPreserveScroll(el, txt);
+let __sugSaveTimer = null;
+
+function saveSugHistorySoon() {
+  try {
+    if (__sugSaveTimer) clearTimeout(__sugSaveTimer);
+    __sugSaveTimer = setTimeout(() => {
+      __sugSaveTimer = null;
+      try {
+        const payload = {
+          v: 1,
+          positivo: sugState.positivo.items.slice(0, SUG_HISTORY_MAX),
+          negativo: sugState.negativo.items.slice(0, SUG_HISTORY_MAX),
+        };
+        localStorage.setItem(SUG_HISTORY_STORE_KEY, JSON.stringify(payload));
+      } catch {}
+    }, 350);
+  } catch {}
+}
+
+function loadSugHistory() {
+  try {
+    const raw = localStorage.getItem(SUG_HISTORY_STORE_KEY);
+    if (!raw) return;
+
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") return;
+
+    const normArr = (a) =>
+      (Array.isArray(a) ? a : [])
+        .map((x) => ({
+          id: String(x?.id || ""),
+          ts: Number(x?.ts || 0) || Date.now(),
+          text: String(x?.text || ""),
+          done: x?.done !== false,
+        }))
+        .filter((x) => x.id && x.text)
+        .slice(0, SUG_HISTORY_MAX);
+
+    sugState.positivo.items = normArr(obj.positivo);
+    sugState.negativo.items = normArr(obj.negativo);
+  } catch {}
+}
+
+function sugSelectedText(slot) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+  const id = st.openId || st.items[0]?.id || "";
+  if (!id) return "";
+  const it = st.items.find((x) => x.id === id);
+  return String(it?.text || "");
+}
+
+function withBoxScrollPreserved(el, fn) {
+  if (!el) return fn();
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  const top = el.scrollTop;
+  fn();
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+  else el.scrollTop = top;
+}
+
+function sugOpenOnly(slot, id) {
+  slot = sugSlotNorm(slot);
+  const host = sugHost(slot);
+  if (!host) return;
+
+  // fecha todos os outros no DOM
+  host.querySelectorAll("details.mt-hist-item").forEach((d) => {
+    if (d.dataset?.id !== id) d.open = false;
+  });
+
+  sugState[slot].openId = id || null;
+  saveSugHistorySoon();
+}
+
+// ✅ FIX: removido o bloco solto que fazia left.appendChild(chev) fora do sugRender
+
+function sugRender(slot) {
+  slot = sugSlotNorm(slot);
+  const host = sugHost(slot);
+  if (!host) return;
+
+  const st = sugState[slot];
+  const items = st.items.slice(0, SUG_HISTORY_MAX);
+
+  withBoxScrollPreserved(host, () => {
+    host.innerHTML = "";
+
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "mt-hist-empty";
+      empty.textContent = "(sem respostas ainda)";
+      host.appendChild(empty);
+      return;
+    }
+
+    const wrap = document.createElement("div");
+    wrap.className = "mt-hist-wrap";
+
+    for (let idx = 0; idx < items.length; idx++) {
+      const it = items[idx];
+
+      const details = document.createElement("details");
+      details.className = "mt-hist-item";
+      details.dataset.id = it.id;
+      details.open = st.openId ? st.openId === it.id : idx === 0;
+
+      const summary = document.createElement("summary");
+      summary.className = "mt-hist-sum";
+
+      const left = document.createElement("div");
+      left.className = "mt-hist-left";
+
+      // chevron open/close (▸ / ▾)
+      const chev = document.createElement("span");
+      chev.className = "mt-hist-chevron";
+      chev.setAttribute("aria-hidden", "true");
+      left.appendChild(chev);
+
+      const badge = document.createElement("span");
+      badge.className = "mt-hist-badge";
+      badge.textContent = idx === 0 ? "🆕" : "↩︎";
+
+      const title = document.createElement("span");
+      title.className = "mt-hist-title";
+      title.textContent = `Resposta ${slot === "positivo" ? "Positiva" : "Negativa"}`;
+
+      left.appendChild(badge);
+      left.appendChild(title);
+
+      const right = document.createElement("div");
+      right.className = "mt-hist-right";
+
+      const ts = document.createElement("span");
+      ts.className = "mt-hist-ts";
+      ts.textContent = sugTimeLabel(it.ts);
+
+      const state = document.createElement("span");
+      state.className = "mt-hist-state";
+      state.textContent = it.done ? "✅" : "⏳";
+
+      right.appendChild(ts);
+      right.appendChild(state);
+
+      summary.appendChild(left);
+      summary.appendChild(right);
+
+      const body = document.createElement("div");
+      body.className = "mt-hist-body";
+      body.textContent = String(it.text || "").trim();
+
+      details.appendChild(summary);
+      details.appendChild(body);
+
+      // toggle: quando abre um, fecha os outros
+      details.addEventListener("toggle", () => {
+        if (details.open) {
+          sugOpenOnly(slot, it.id);
+        } else {
+          if (sugState[slot].openId === it.id) sugState[slot].openId = null;
+          saveSugHistorySoon();
+        }
+      });
+
+      wrap.appendChild(details);
+    }
+
+    host.appendChild(wrap);
+  });
+}
+
+function sugPrune(slot) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+  st.items = (st.items || []).slice(0, SUG_HISTORY_MAX);
+}
+
+function sugStartLive(slot) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+
+  const id = sugId();
+  const reading = !!st.openId;
+
+  const it = { id, ts: Date.now(), text: "", done: false };
+  st.items.unshift(it);
+  st.liveId = id;
+
+  if (!reading) st.openId = id;
+  sugPrune(slot);
+  saveSugHistorySoon();
+  sugRender(slot);
+  return id;
+}
+
+function sugUpdateLive(slot, text) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+
+  const t = tail(String(text || ""), 12000);
+  if (!st.liveId) sugStartLive(slot);
+
+  const it = st.items.find((x) => x.id === st.liveId);
+  if (!it) return;
+
+  it.text = t;
+  sugPrune(slot);
+  sugRender(slot);
+}
+
+function sugFinalizeLive(slot) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+
+  if (!st.liveId) return;
+  const it = st.items.find((x) => x.id === st.liveId);
+  if (it) it.done = true;
+
+  st.liveId = null;
+  saveSugHistorySoon();
+  sugRender(slot);
+}
+
+function sugAddFinal(slot, text) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+
+  const t = tail(String(text || ""), 12000).trim();
+  if (!t) return;
+
+  const last = st.items[0]?.text ? String(st.items[0].text).trim() : "";
+  if (last && last === t) return;
+
+  const reading = !!st.openId;
+  const it = { id: sugId(), ts: Date.now(), text: t, done: true };
+
+  st.items.unshift(it);
+  if (!reading) st.openId = it.id;
+
+  sugPrune(slot);
+  saveSugHistorySoon();
+  sugRender(slot);
+}
+
+// Compat antigo: não apaga histórico
+function setAllSuggestionSlots(_) {}
+function setSuggestionSlot(slot, raw) {
+  slot = sugSlotNorm(slot);
+  sugUpdateLive(slot, raw);
 }
 
 // =====================================================
@@ -916,6 +1083,24 @@ function displayLineAuthorAndText(line) {
   return normalizeSpacesOneLine(raw.replace(/^🎤\s*/u, ""));
 }
 
+function splitTeamsInlineTurns(raw) {
+  const s = normalizeSpacesOneLine(raw);
+  if (!/Teams\s*[•·-]/i.test(s) || s.indexOf(":") < 0) return null;
+
+  const re =
+    /Teams\s*[•·-]\s*([^:]{1,80}?)\s*:\s*([\s\S]*?)(?=\s*Teams\s*[•·-]\s*[^:]{1,80}?\s*:|$)/gi;
+
+  const out = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const sp = normalizeSpacesOneLine(m[1]);
+    const msg = normalizeSpacesOneLine(m[2]);
+    if (!sp || !msg) continue;
+    out.push({ speaker: sp, text: msg });
+  }
+  return out.length ? out : null;
+}
+
 function formatBlockForPanel(raw) {
   const lines = String(raw || "")
     .split("\n")
@@ -941,6 +1126,13 @@ function formatBlockForPanel(raw) {
 // =====================================================
 // ✅ Bloco corrigido (IA) — só Autor: mensagem
 // =====================================================
+function setTextPreserveScroll(el, text) {
+  if (!el) return;
+  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < PANEL_SCROLL_LOCK_PX;
+  el.textContent = text || "";
+  if (nearBottom) el.scrollTop = el.scrollHeight;
+}
+
 function setFixedBlock(raw) {
   panelFixedBlockCache = tail(formatBlockForPanel(String(raw || "").trim()), 12000);
   const el = document.getElementById(UI_IDS.panelFixedBlock);
@@ -973,13 +1165,6 @@ function isPanelOpen() {
   return document.documentElement.classList.contains("__mt_panel_open");
 }
 
-function setTextPreserveScroll(el, text) {
-  if (!el) return;
-  const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < PANEL_SCROLL_LOCK_PX;
-  el.textContent = text || "";
-  if (nearBottom) el.scrollTop = el.scrollHeight;
-}
-
 function withPanelTranscriptScrollPreserved(fn) {
   const host = document.getElementById(UI_IDS.panelTranscript);
   if (!host) return fn();
@@ -991,17 +1176,29 @@ function withPanelTranscriptScrollPreserved(fn) {
 // =====================================================
 // ✅ Teams RTT buffer (anti “pipoco”)
 // =====================================================
-let teamsRttBuf = new Map(); // key(origin::speaker) -> { text, lastUpdateAt }
-let teamsRttLastCommitted = new Map(); // key(origin::speaker) -> last committed text
+let teamsRttBuf = new Map(); // origin::speaker -> { text, lastUpdateAt }
+let teamsRttLastCommitted = new Map(); // origin::speaker -> last committed
 let teamsRttTimerId = null;
 
 function teamsRttKey(origin, speaker) {
   return `${String(origin || "").trim()}::${String(speaker || "").trim()}`;
 }
 
+function startTeamsRttTimerIfNeeded() {
+  if (teamsRttTimerId) return;
+  teamsRttTimerId = setInterval(commitTeamsRttIfReady, TEAMS_RTT_COMMIT_CHECK_MS);
+}
+
+function stopTeamsRttTimerIfIdle() {
+  if (teamsRttTimerId && teamsRttBuf.size === 0) {
+    clearInterval(teamsRttTimerId);
+    teamsRttTimerId = null;
+  }
+}
+
 function noteTeamsRtt(speaker, text) {
   const origin = "Teams";
-  speaker = normalizeSpacesOneLine(speaker || "Desconhecido");
+  speaker = normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL);
   speaker = guessSpeakerIfUnknown(speaker);
 
   if (!CAPTURE_SELF_LINES && isMe(speaker)) return;
@@ -1009,9 +1206,7 @@ function noteTeamsRtt(speaker, text) {
   let msg = normalizeSpacesOneLine(cleanCaptionText(text));
   if (!msg) return;
 
-  // ✅ FIX: colapsa eco antes de bufferizar
   msg = collapseTeamsRepeats(msg);
-
   if (isJunkCaptionText(msg)) return;
 
   const trimmed = msg.trim();
@@ -1028,19 +1223,8 @@ function noteTeamsRtt(speaker, text) {
   } else {
     teamsRttBuf.set(k, { text: trimmed, lastUpdateAt: now });
   }
+
   startTeamsRttTimerIfNeeded();
-}
-
-function startTeamsRttTimerIfNeeded() {
-  if (teamsRttTimerId) return;
-  teamsRttTimerId = setInterval(commitTeamsRttIfReady, TEAMS_RTT_COMMIT_CHECK_MS);
-}
-
-function stopTeamsRttTimerIfIdle() {
-  if (teamsRttTimerId && teamsRttBuf.size === 0) {
-    clearInterval(teamsRttTimerId);
-    teamsRttTimerId = null;
-  }
 }
 
 function commitTeamsRttIfReady() {
@@ -1049,7 +1233,8 @@ function commitTeamsRttIfReady() {
 
   for (const [k, st] of teamsRttBuf.entries()) {
     const origin = "Teams";
-    const speaker = k.split("::").slice(1).join("::") || "Desconhecido";
+    const speaker = k.split("::").slice(1).join("::") || UNKNOWN_SPEAKER_LABEL;
+
     const text = String(st?.text || "").trim();
     const lastAt = Number(st?.lastUpdateAt || 0);
 
@@ -1062,7 +1247,6 @@ function commitTeamsRttIfReady() {
     const finalNow = hasFinalPunct(text);
 
     if (!finalNow && idleFor < TEAMS_RTT_IDLE_COMMIT_MS) continue;
-
     if (!finalNow && text.length < TEAMS_RTT_MIN_CHARS) {
       teamsRttBuf.delete(k);
       continue;
@@ -1135,6 +1319,7 @@ function getRecentLinesForRewriteScan(maxLines = AUTO_FIX_SCAN_LINES) {
     .map((s) => s.trim())
     .filter(Boolean)
     .filter((l) => !isInternalInjectedLine(l));
+
   if (!lines.length) return [];
   return lines.slice(-Math.max(1, maxLines));
 }
@@ -1167,7 +1352,7 @@ function hasUnfixedTeamsInScan() {
 }
 
 // =====================================================
-// Heurística: junta “pipocos” (co + mo => como)
+// Heurística: junta “pipocos”
 // =====================================================
 function mergePipocadas(lines) {
   const out = [];
@@ -1194,6 +1379,7 @@ function mergePipocadas(lines) {
 
     if (last && last.origin === origin && last.speaker === speaker) {
       const prevText = last.text || "";
+
       if (isTinyToken(prevText) && isTinyToken(t)) {
         last.text = prevText + t;
         continue;
@@ -1212,9 +1398,6 @@ function mergePipocadas(lines) {
   return out.map((x) => `${x.origin}: ${x.speaker}: ${x.text}`.trim());
 }
 
-// =====================================================
-// ✅ Merge de linhas contíguas por origin+speaker
-// =====================================================
 function mergeRunsBySpeaker(lines) {
   const joinWithSpace = (a, b) => {
     a = String(a || "").trim();
@@ -1233,16 +1416,19 @@ function mergeRunsBySpeaker(lines) {
     const probe = String(raw || "").trim().startsWith("🎤")
       ? String(raw).trim()
       : `🎤 ${String(raw || "").trim()}`;
+
     const p = parseTranscriptLine(probe);
     const origin = String(p.origin || "").trim() || "Teams";
-    const speaker = String(p.speaker || "").trim() || "Desconhecido";
+    const speaker = String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL;
     const text = normalizeSpacesOneLine(p.text || "");
+
     if (!text) continue;
 
     if (cur && cur.origin === origin && cur.speaker === speaker) {
       cur.text = joinWithSpace(cur.text, text);
       continue;
     }
+
     if (cur) out.push(cur);
     cur = { origin, speaker, text };
   }
@@ -1268,6 +1454,7 @@ function buildReplySeedFromTail(maxLines = AUTO_IA_MAX_LINES) {
 function findSegmentIndex(lines, segmentLines) {
   if (!lines?.length || !segmentLines?.length) return -1;
   const n = segmentLines.length;
+
   outer: for (let i = lines.length - n; i >= 0; i--) {
     for (let j = 0; j < n; j++) {
       if (lines[i + j] !== segmentLines[j]) continue outer;
@@ -1277,12 +1464,16 @@ function findSegmentIndex(lines, segmentLines) {
   return -1;
 }
 
+function scheduleFlushSoon() {
+  if (flushDebounceId) clearTimeout(flushDebounceId);
+  flushDebounceId = setTimeout(() => flushNow("debounce"), FLUSH_DEBOUNCE_MS);
+}
+
 function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
   const markFixedNow = opts.markFixed === true;
-  const fixedBlockText =
-    typeof opts.fixedBlockText === "string" ? opts.fixedBlockText : null;
+  const fixedBlockText = typeof opts.fixedBlockText === "string" ? opts.fixedBlockText : null;
 
-  // -------- PANEL CACHE --------
+  // PANEL CACHE
   const panelLines = String(panelTranscriptCache || "")
     .split("\n")
     .map((s) => s.trim())
@@ -1300,7 +1491,7 @@ function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
   rebuildPanelLineSetFromCache();
   renderTranscriptListFromCache();
 
-  // -------- TRANSCRIPT DATA --------
+  // TRANSCRIPT DATA
   const fullLines = String(transcriptData || "")
     .split("\n")
     .map((s) => s.trim())
@@ -1328,18 +1519,110 @@ function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
   }
 
   if (fixedBlockText != null) setFixedBlock(fixedBlockText);
-
   scheduleFlushSoon();
   return true;
 }
 
 // =====================================================
-// ✅ Merge-before-rewrite: aplica merge no histórico e retorna segment pronto
+// ✅ Tagged lines extractor (⟦L01⟧)
 // =====================================================
-function prepareSegmentForRewrite(rawSegmentLines) {
+function extractTaggedLines(rewritten, expectedCount) {
+  const raw = Array.isArray(rewritten) ? rewritten.join("\n") : String(rewritten || "");
+  if (!/⟦L\d{2}⟧/u.test(raw)) return null;
+
+  const map = new Array(expectedCount).fill(null);
+  const re = /⟦L(\d{2})⟧\s*([\s\S]*?)(?=⟦L\d{2}⟧|$)/gu;
+
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const idx = parseInt(m[1], 10) - 1;
+    if (idx < 0 || idx >= expectedCount) continue;
+    map[idx] = String(m[2] || "").trim();
+  }
+
+  if (map.some((x) => !x)) return null;
+  return map;
+}
+
+// =====================================================
+// ✅ Build safe rewrite preserving speakers
+// =====================================================
+function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOrText) {
   const rawSeg = (rawSegmentLines || [])
     .map((s) => String(s || "").trim())
     .filter(Boolean);
+
+  if (!rawSeg.length) return null;
+
+  // fonte da verdade p/ origin + speaker
+  const rawP = rawSeg.map((ln) => {
+    const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
+    const p = parseTranscriptLine(probe);
+    return {
+      origin: String(p.origin || "").trim() || "Teams",
+      speaker: String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL,
+      text: String(p.text || "").trim(),
+    };
+  });
+
+  const expected = rawP.length;
+
+  const tagged = extractTaggedLines(rewrittenLinesOrText, expected);
+  if (tagged) rewrittenLinesOrText = tagged;
+
+  let outLines = Array.isArray(rewrittenLinesOrText)
+    ? rewrittenLinesOrText
+    : String(rewrittenLinesOrText || "").split("\n");
+
+  outLines = outLines.map((s) => String(s || "").trim()).filter(Boolean);
+  if (!outLines.length) return null;
+
+  // expande inline-turns
+  const expanded = [];
+  for (const ln of outLines) {
+    const turns = splitTeamsInlineTurns(ln);
+    if (turns && turns.length) {
+      for (const t of turns) expanded.push(`Teams: ${t.speaker}: ${t.text}`);
+    } else {
+      expanded.push(ln);
+    }
+  }
+  outLines = expanded;
+
+  if (outLines.length !== rawP.length) return null;
+
+  const safe = [];
+  for (let i = 0; i < rawP.length; i++) {
+    const src = rawP[i];
+    const ln = outLines[i];
+
+    const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
+    const p = parseTranscriptLine(probe);
+
+    let newText = "";
+    if (p && p.text) newText = p.text;
+    else {
+      const m = String(ln).match(/^([^:]{1,80})\s*:\s*(.+)$/u);
+      newText = m ? m[2] : ln;
+    }
+
+    newText = normalizeSpacesOneLine(newText);
+
+    // se veio “Teams • ...” dentro do texto, aborta (colagem)
+    if (/Teams\s*[•·-]/i.test(newText)) return null;
+    if (!newText) newText = src.text || "";
+
+    safe.push(`${src.origin}: ${src.speaker}: ${newText}`);
+  }
+
+  return safe.length ? safe : null;
+}
+
+// =====================================================
+// ✅ Merge-before-rewrite: aplica merge no histórico
+// =====================================================
+function prepareSegmentForRewrite(rawSegmentLines) {
+  const rawSeg = (rawSegmentLines || []).map((s) => String(s || "").trim()).filter(Boolean);
   if (!rawSeg.length) return null;
 
   const mergedNoMic = mergeForRewrite(rawSeg);
@@ -1355,7 +1638,10 @@ function prepareSegmentForRewrite(rawSegmentLines) {
       fixedBlockText: mergedNoMic.join("\n"),
     });
     if (!ok) {
-      return { segCacheLines: rawSeg, segLlmLines: rawSeg.map(normalizeTranscriptLineForLLM) };
+      return {
+        segCacheLines: rawSeg,
+        segLlmLines: rawSeg.map(normalizeTranscriptLineForLLM),
+      };
     }
   }
 
@@ -1364,19 +1650,12 @@ function prepareSegmentForRewrite(rawSegmentLines) {
     return `⟦L${id}⟧ ${ln}`;
   });
 
-  return {
-    segCacheLines: same ? rawSeg : mergedWithMic,
-    segLlmLines: taggedForLlm,
-  };
+  return { segCacheLines: same ? rawSeg : mergedWithMic, segLlmLines: taggedForLlm };
 }
 
 function applyRewriteToSegment(rawSegmentLines, rewrittenLines) {
-  const rawSeg = (rawSegmentLines || [])
-    .map((s) => String(s || "").trim())
-    .filter(Boolean);
-  const newSeg = (rewrittenLines || [])
-    .map((s) => String(s || "").trim())
-    .filter(Boolean);
+  const rawSeg = (rawSegmentLines || []).map((s) => String(s || "").trim()).filter(Boolean);
+  const newSeg = (rewrittenLines || []).map((s) => String(s || "").trim()).filter(Boolean);
   if (!rawSeg.length || !newSeg.length) return false;
 
   const newWithMic = newSeg.map((s) => (s.startsWith("🎤") ? s : `🎤 ${s}`));
@@ -1410,6 +1689,7 @@ function renderTranscriptListFromCache() {
     }
 
     const displayLines = lines.slice(-TRANSCRIPT_DISPLAY_MAX_LINES).reverse();
+
     for (const line of displayLines) {
       const row = document.createElement("div");
       row.title = line;
@@ -1478,10 +1758,12 @@ function toggleAutoIa() {
   try {
     localStorage.setItem("__mt_auto_ia", autoIaEnabled ? "1" : "0");
   } catch {}
+
   if (!autoIaEnabled) cancelAutoIaTimer();
 
   const btn = document.getElementById(UI_IDS.panelAutoIaBtn);
   if (btn) btn.textContent = autoIaEnabled ? "Auto IA: ON" : "Auto IA: OFF";
+
   setPanelStatus(autoIaEnabled ? "Auto IA ligado ✅" : "Auto IA desligado 📴");
 }
 
@@ -1499,36 +1781,8 @@ function loadAutoIaSetting() {
 let rewriteInFlight = false;
 let lastRewriteRequestKey = "";
 
-function requestRewriteContext(lines, cb) {
-  if (!aiAllowedHere()) return cb(null);
-  if (rewriteInFlight) return cb(null);
-
-  const merged = Array.isArray(lines) ? lines : [];
-  const payloadStr = merged.join("\n").trim();
-  if (!payloadStr) return cb(null);
-
-  const reqKey = fastHash(payloadStr);
-  if (reqKey === lastRewriteRequestKey) return cb(null);
-  lastRewriteRequestKey = reqKey;
-
-  rewriteInFlight = true;
-
-  safeSendMessage(
-    {
-      action: "rewriteContext",
-      payload: { lines: merged, wantLines: true, fmt: "origin:speaker:text" },
-    },
-    (res) => {
-      rewriteInFlight = false;
-      if (chrome.runtime?.lastError) return cb(null);
-      const parsed = parseRewriteResponse(res);
-      cb(parsed);
-    }
-  );
-}
-
 // =====================================================
-// ✅ NOVO: corrigir TODOS os blocos Teams não fixados no scan
+// ✅ corrigir TODOS os blocos Teams não fixados no scan
 // =====================================================
 function autoFixUntilClean(opts, done) {
   if (!aiAllowedHere()) return done({ didAny: false, remaining: false });
@@ -1560,8 +1814,11 @@ function autoFixUntilClean(opts, done) {
     const used = logicRetryByKey.get(segKey) || 0;
 
     setPanelStatus(
-      `${opts?.auto ? "Auto IA: corrigindo frases (IA)..." : "Corrigindo frases (IA)..."} (${blocksTried + 1}/${AUTO_FIX_SEGMENTS_BUDGET})`
+      `${opts?.auto ? "Auto IA: corrigindo frases (IA)..." : "Corrigindo frases (IA)..."} (${
+        blocksTried + 1
+      }/${AUTO_FIX_SEGMENTS_BUDGET})`
     );
+
     setLauncherState("busy");
     setAllSuggestionSlots("");
 
@@ -1576,7 +1833,10 @@ function autoFixUntilClean(opts, done) {
       }
 
       const linesOut = Array.isArray(rw.lines) && rw.lines.length ? rw.lines : null;
-      const safeLines = buildSafeRewriteLinesPreserveSpeakers(prep.segCacheLines, linesOut || rw.text);
+      const safeLines = buildSafeRewriteLinesPreserveSpeakers(
+        prep.segCacheLines,
+        linesOut || rw.text
+      );
 
       if (!safeLines) {
         setFixedBlock((linesOut ? linesOut.join("\n") : rw.text) || "");
@@ -1654,15 +1914,15 @@ function requestRepliesForText(text, originLabel = "context") {
           finishReplyLock();
           return fallbackTwoSuggestions(clean);
         }
-        setPanelStatus("Erro: generateReplies falhou (fallback 2 chamadas OFF).");
+        setPanelStatus("Erro: generateReplies falhou (fallback OFF).");
         setLauncherState("error");
         finishReplyLock();
         return;
       }
 
       if (res?.suggestions && typeof res.suggestions === "object") {
-        setSuggestionSlot("positivo", String(res.suggestions.positivo || ""));
-        setSuggestionSlot("negativo", String(res.suggestions.negativo || ""));
+        sugAddFinal("positivo", String(res.suggestions.positivo || ""));
+        sugAddFinal("negativo", String(res.suggestions.negativo || ""));
         setPanelStatus("Respostas prontas ✅");
         setLauncherState("ok");
         finishReplyLock();
@@ -1685,6 +1945,7 @@ function requestRepliesForText(text, originLabel = "context") {
         finishReplyLock();
         return fallbackTwoSuggestions(clean);
       }
+
       setPanelStatus("Erro: resposta inesperada do background.");
       setLauncherState("error");
       finishReplyLock();
@@ -1709,7 +1970,8 @@ function requestRepliesForText(text, originLabel = "context") {
         finishReplyLock();
         return;
       }
-      setSuggestionSlot("positivo", String(r1?.suggestion || "").trim());
+
+      sugAddFinal("positivo", String(r1?.suggestion || "").trim());
 
       sendAskMeSuggestion(seed, { route: "negativo", origin: originLabel }, (r2) => {
         if (chrome.runtime?.lastError) {
@@ -1724,7 +1986,8 @@ function requestRepliesForText(text, originLabel = "context") {
           finishReplyLock();
           return;
         }
-        setSuggestionSlot("negativo", String(r2?.suggestion || "").trim());
+
+        sugAddFinal("negativo", String(r2?.suggestion || "").trim());
         setPanelStatus("Respostas prontas ✅");
         setLauncherState("ok");
         finishReplyLock();
@@ -1752,10 +2015,9 @@ function startAutoIaFromTail(opts = {}) {
 
   const sourceHash = fastHash(sourceStr);
   const stillHasUnfixed = hasUnfixedTeamsInScan();
-
   if (sourceHash === lastAutoIaSourceHash && !stillHasUnfixed) return;
-  lastAutoIaSourceHash = sourceHash;
 
+  lastAutoIaSourceHash = sourceHash;
   if (!opts.auto) suppressAutoIaForPayload(sourceStr);
 
   setPanelStatus(opts.auto ? "Auto IA: corrigindo frases (IA)..." : "Corrigindo frases (IA)...");
@@ -1812,6 +2074,7 @@ function rewriteSegmentUntilApplied(rawSegLines, triesLeft, cb) {
     if (safeLines && applyRewriteToSegment(segCache, safeLines)) return cb(true);
 
     setFixedBlock((linesOut ? linesOut.join("\n") : rw.text) || "");
+
     if (triesLeft > 0) return setTimeout(() => rewriteSegmentUntilApplied(segCache, triesLeft - 1, cb), 220);
     cb(false);
   });
@@ -1905,6 +2168,7 @@ function ensurePanelUI() {
 
   loadAutoIaSetting();
   loadFixedFlags();
+  loadSugHistory();
 
   const panel = document.createElement("div");
   panel.id = UI_IDS.panel;
@@ -1918,11 +2182,14 @@ function ensurePanelUI() {
         <button id="${UI_IDS.panelClose}" title="Fechar">✕</button>
       </div>
     </div>
+
     <div id="${UI_IDS.panelStatus}">Pronto.</div>
+
     <div id="${UI_IDS.panelTranscript}">
       <div class="mt-transcript-title">Transcrição (histórico):</div>
       <div class="mt-transcript-list" id="__mt_transcript_list"></div>
     </div>
+
     <div id="${UI_IDS.panelSuggestionsWrap}">
       <div class="mt-fixed-head">
         <div class="mt-fixed-title">Bloco corrigido (IA)</div>
@@ -1969,30 +2236,30 @@ function ensurePanelUI() {
   });
 
   panel.querySelector(`#${UI_IDS.panelSugCopyPos}`)?.addEventListener("click", () => {
-    copyToClipboard(panelSuggestionCache.positivo);
+    copyToClipboard(sugSelectedText("positivo"));
   });
-
   panel.querySelector(`#${UI_IDS.panelSugCopyNeg}`)?.addEventListener("click", () => {
-    copyToClipboard(panelSuggestionCache.negativo);
+    copyToClipboard(sugSelectedText("negativo"));
   });
-
   panel.querySelector(`#${UI_IDS.panelFixedCopy}`)?.addEventListener("click", () => {
     copyToClipboard(panelFixedBlockCache);
   });
 
   setPanelTranscriptText(transcriptData ? tail(transcriptData, PANEL_HISTORY_MAX_CHARS) : "");
-  setSuggestionSlot("positivo", panelSuggestionCache.positivo);
-  setSuggestionSlot("negativo", panelSuggestionCache.negativo);
+  sugRender("positivo");
+  sugRender("negativo");
   setFixedBlock(panelFixedBlockCache);
 }
 
 function openPanel() {
   ensurePanelUI();
   document.documentElement.classList.add("__mt_panel_open");
+
   if (transcriptData) setPanelTranscriptText(tail(transcriptData, PANEL_HISTORY_MAX_CHARS));
-  setSuggestionSlot("positivo", panelSuggestionCache.positivo);
-  setSuggestionSlot("negativo", panelSuggestionCache.negativo);
+  sugRender("positivo");
+  sugRender("negativo");
   setFixedBlock(panelFixedBlockCache);
+
   refreshPanel();
 }
 
@@ -2063,125 +2330,67 @@ function injectLauncherUI() {
 
   const style = document.createElement("style");
   style.id = UI_IDS.style;
-
   style.textContent = `
-    #${UI_IDS.overlay}{
-      position: fixed; inset: 0; background: rgba(0,0,0,0.35);
-      z-index: 2147483646; display: none; pointer-events: none;
-    }
-    #${UI_IDS.overlay}.active{ display:block; }
-
-    #${UI_IDS.bubble}{
-      position: fixed; right: 16px; bottom: 16px;
-      width: 48px; height: 48px; border-radius: 50%;
-      z-index: 2147483647; display:flex; align-items:center; justify-content:center;
-      background: rgba(20,20,20,0.92); color:#fff;
-      font: 700 12px/1 Arial, sans-serif; letter-spacing:.5px;
-      box-shadow: 0 10px 24px rgba(0,0,0,.25);
-      cursor:pointer; user-select:none;
-    }
-    #${UI_IDS.bubble} .dot{
-      position:absolute; right:6px; bottom:6px;
-      width:10px; height:10px; border-radius:50%;
-      background:#2ecc71; box-shadow:0 0 0 4px rgba(46,204,113,0.15);
-    }
-    #${UI_IDS.bubble}.busy .dot{
-      background:#f1c40f; box-shadow:0 0 0 4px rgba(241,196,15,0.18);
-      animation: __mt_pulse 900ms ease-in-out infinite;
-    }
-    #${UI_IDS.bubble}.error .dot{
-      background:#e74c3c; box-shadow:0 0 0 4px rgba(231,76,60,0.18);
-      animation:none;
-    }
-    #${UI_IDS.bubble}:hover{ transform: translateY(-1px); }
-    @keyframes __mt_pulse{ 0%{transform:scale(1)} 50%{transform:scale(1.25)} 100%{transform:scale(1)} }
-
-    :root{ --mt_panel_w: min(25vw, 520px); }
-    #${UI_IDS.panel}{
-      position: fixed; top:0; right:0; width: var(--mt_panel_w); min-width: 360px; height: 100vh;
-      z-index: 2147483645; background: rgba(16,16,18,0.97); color:#fff;
-      border-left: 1px solid rgba(255,255,255,0.08);
-      box-shadow: -18px 0 40px rgba(0,0,0,0.35);
-      transform: translateX(100%); transition: transform 160ms ease-out;
-      pointer-events:auto; display:flex; flex-direction:column; font: 12px/1.35 Arial, sans-serif;
-    }
-    :root.__mt_panel_open #${UI_IDS.panel}{ transform: translateX(0); }
-    :root.__mt_panel_open body{ margin-right: var(--mt_panel_w); overflow-x:hidden; }
-
-    #${UI_IDS.panelHeader}{
-      display:flex; align-items:center; justify-content:space-between;
-      gap:10px; padding:10px; border-bottom:1px solid rgba(255,255,255,0.08);
-    }
-    #${UI_IDS.panelHeader} .title{ font-weight:900; letter-spacing:.4px; }
-    #${UI_IDS.panelHeader} .actions{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    #${UI_IDS.panelHeader} button{
-      background: rgba(255,255,255,0.10); color:#fff;
-      border:1px solid rgba(255,255,255,0.14);
-      border-radius:10px; padding:6px 10px; cursor:pointer;
-      font: 800 11px/1 Arial, sans-serif; white-space:nowrap;
-    }
-    #${UI_IDS.panelHeader} button:hover{ background: rgba(255,255,255,0.16); }
-
-    #${UI_IDS.panelStatus}{
-      padding:8px 10px; color: rgba(255,255,255,0.75);
-      border-bottom:1px solid rgba(255,255,255,0.06); font-size:11px;
-    }
-
-    #${UI_IDS.panelTranscript}{ padding:10px; overflow:auto; flex:1; border-bottom:1px solid rgba(255,255,255,0.06); }
-    .mt-transcript-title{ font-weight:900; margin-bottom:8px; color: rgba(255,255,255,0.85); }
-    .mt-transcript-list{ display:flex; flex-direction:column; gap:6px; }
-
-    .mt-line{
-      display:flex; align-items:flex-start; justify-content:space-between; gap:10px;
-      padding:8px; border:1px solid rgba(255,255,255,0.08);
-      border-radius:10px; background: rgba(255,255,255,0.04);
-    }
-    .mt-line:hover{ background: rgba(255,255,255,0.06); }
-    .mt-line.fixed{ border-color: rgba(46,204,113,0.55); background: rgba(46,204,113,0.10); }
-    .mt-line-text{ white-space:pre-wrap; word-break:break-word; flex:1; opacity:.95; }
-    .mt-flag{ display:inline-block; margin-right:6px; font-weight:900; }
-    .mt-line-btn{
-      flex:none; background: rgba(46,204,113,0.18);
-      border: 1px solid rgba(46,204,113,0.35);
-      border-radius:10px; padding:6px 10px; color:#fff; cursor:pointer;
-      font-weight:900; font-size:11px; line-height:1; white-space:nowrap;
-    }
-    .mt-line-btn:hover{ background: rgba(46,204,113,0.24); }
-
-    #${UI_IDS.panelSuggestionsWrap}{ padding:10px; overflow:auto; flex:1; }
-    .mt-fixed-head{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
-    .mt-fixed-title{ font-weight:900; color: rgba(255,255,255,0.92); }
-    .mt-fixed-box{
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
-      border-radius:12px; padding:10px; max-height:160px; overflow:auto;
-      white-space:pre-wrap; word-break:break-word; margin-bottom:8px;
-    }
-    .mt-mini-btn{
-      background: rgba(255,255,255,0.10); color:#fff;
-      border:1px solid rgba(255,255,255,0.14);
-      border-radius:10px; padding:6px 10px; cursor:pointer;
-      font: 900 11px/1 Arial, sans-serif; white-space:nowrap;
-    }
-    .mt-mini-btn:hover{ background: rgba(255,255,255,0.16); }
-    .mt-mini-btn.ok{ background: rgba(46,204,113,0.18); border: 1px solid rgba(46,204,113,0.35); }
-    .mt-mini-btn.ok:hover{ background: rgba(46,204,113,0.24); }
-
-    .mt-sug-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:10px; }
-    .mt-sug-title{ font-weight:900; color: rgba(255,255,255,0.92); }
-    .mt-sug-grid{ display:grid; grid-template-columns: 1fr; gap:10px; }
-    .mt-sug-card{
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius:12px; background: rgba(255,255,255,0.04); padding:10px;
-    }
-    .mt-sug-card-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px; }
-    .mt-sug-card-title{ font-weight:900; opacity:.95; }
-    .mt-sug-box{
-      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
-      border-radius:12px; padding:10px; max-height:220px; overflow:auto;
-      white-space:pre-wrap; word-break:break-word;
-    }
+    #${UI_IDS.overlay}{position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:2147483646;display:none;pointer-events:none}
+    #${UI_IDS.overlay}.active{display:block}
+    #${UI_IDS.bubble}{position:fixed;right:16px;bottom:16px;width:48px;height:48px;border-radius:50%;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(20,20,20,0.92);color:#fff;font:700 12px/1 Arial,sans-serif;letter-spacing:.5px;box-shadow:0 10px 24px rgba(0,0,0,.25);cursor:pointer;user-select:none}
+    #${UI_IDS.bubble} .dot{position:absolute;right:6px;bottom:6px;width:10px;height:10px;border-radius:50%;background:#2ecc71;box-shadow:0 0 0 4px rgba(46,204,113,0.15)}
+    #${UI_IDS.bubble}.busy .dot{background:#f1c40f;box-shadow:0 0 0 4px rgba(241,196,15,0.18);animation:__mt_pulse 900ms ease-in-out infinite}
+    #${UI_IDS.bubble}.error .dot{background:#e74c3c;box-shadow:0 0 0 4px rgba(231,76,60,0.18);animation:none}
+    #${UI_IDS.bubble}:hover{transform:translateY(-1px)}
+    @keyframes __mt_pulse{0%{transform:scale(1)}50%{transform:scale(1.25)}100%{transform:scale(1)}}
+    :root{--mt_panel_w:min(25vw,520px)}
+    #${UI_IDS.panel}{position:fixed;top:0;right:0;width:var(--mt_panel_w);min-width:360px;height:100vh;z-index:2147483645;background:rgba(16,16,18,0.97);color:#fff;border-left:1px solid rgba(255,255,255,0.08);box-shadow:-18px 0 40px rgba(0,0,0,0.35);transform:translateX(100%);transition:transform 160ms ease-out;pointer-events:auto;display:flex;flex-direction:column;font:12px/1.35 Arial,sans-serif}
+    :root.__mt_panel_open #${UI_IDS.panel}{transform:translateX(0)}
+    :root.__mt_panel_open body{margin-right:var(--mt_panel_w);overflow-x:hidden}
+    #${UI_IDS.panelHeader}{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;border-bottom:1px solid rgba(255,255,255,0.08)}
+    #${UI_IDS.panelHeader} .title{font-weight:900;letter-spacing:.4px}
+    #${UI_IDS.panelHeader} .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    #${UI_IDS.panelHeader} button{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:800 11px/1 Arial,sans-serif;white-space:nowrap}
+    #${UI_IDS.panelHeader} button:hover{background:rgba(255,255,255,0.16)}
+    #${UI_IDS.panelStatus}{padding:8px 10px;color:rgba(255,255,255,0.75);border-bottom:1px solid rgba(255,255,255,0.06);font-size:11px}
+    #${UI_IDS.panelTranscript}{padding:10px;overflow:auto;flex:1;border-bottom:1px solid rgba(255,255,255,0.06)}
+    .mt-transcript-title{font-weight:900;margin-bottom:8px;color:rgba(255,255,255,0.85)}
+    .mt-transcript-list{display:flex;flex-direction:column;gap:6px}
+    .mt-line{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:8px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:rgba(255,255,255,0.04)}
+    .mt-line:hover{background:rgba(255,255,255,0.06)}
+    .mt-line.fixed{border-color:rgba(46,204,113,0.55);background:rgba(46,204,113,0.10)}
+    .mt-line-text{white-space:pre-wrap;word-break:break-word;flex:1;opacity:.95}
+    .mt-flag{display:inline-block;margin-right:6px;font-weight:900}
+    .mt-line-btn{flex:none;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35);border-radius:10px;padding:6px 10px;color:#fff;cursor:pointer;font-weight:900;font-size:11px;line-height:1;white-space:nowrap}
+    .mt-line-btn:hover{background:rgba(46,204,113,0.24)}
+    #${UI_IDS.panelSuggestionsWrap}{padding:10px;overflow:auto;flex:1}
+    .mt-fixed-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+    .mt-fixed-title{font-weight:900;color:rgba(255,255,255,0.92)}
+    .mt-fixed-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin-bottom:8px}
+    .mt-mini-btn{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:900 11px/1 Arial,sans-serif;white-space:nowrap}
+    .mt-mini-btn:hover{background:rgba(255,255,255,0.16)}
+    .mt-mini-btn.ok{background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35)}
+    .mt-mini-btn.ok:hover{background:rgba(46,204,113,0.24)}
+    .mt-sug-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px}
+    .mt-sug-title{font-weight:900;color:rgba(255,255,255,0.92)}
+    .mt-sug-grid{display:grid;grid-template-columns:1fr;gap:10px}
+    .mt-sug-card{border:1px solid rgba(255,255,255,0.08);border-radius:12px;background:rgba(255,255,255,0.04);padding:10px}
+    .mt-sug-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+    .mt-sug-card-title{font-weight:900;opacity:.95}
+    .mt-sug-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+    /* Collapsible + chevron */
+    .mt-hist-empty{opacity:.7;padding:6px 2px}
+    .mt-hist-wrap{display:flex;flex-direction:column;gap:8px}
+    details.mt-hist-item{border:1px solid rgba(255,255,255,0.10);border-radius:12px;background:rgba(255,255,255,0.03);overflow:hidden}
+    details.mt-hist-item[open]{border-color:rgba(46,204,113,0.38);background:rgba(46,204,113,0.07)}
+    .mt-hist-sum{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;user-select:none;font-weight:900}
+    .mt-hist-sum::-webkit-details-marker{display:none}
+    .mt-hist-left{display:flex;align-items:center;gap:8px;min-width:0}
+    .mt-hist-chevron{width:16px;display:inline-flex;align-items:center;justify-content:center;opacity:.9;flex:none}
+    .mt-hist-chevron::before{content:"▸"}
+    details.mt-hist-item[open] .mt-hist-chevron::before{content:"▾"}
+    .mt-hist-badge{opacity:.95}
+    .mt-hist-title{opacity:.95;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .mt-hist-right{display:flex;align-items:center;gap:10px;opacity:.85;font-weight:800}
+    .mt-hist-ts{font-size:11px}
+    .mt-hist-body{padding:10px;border-top:1px solid rgba(255,255,255,0.08);white-space:pre-wrap;word-break:break-word}
   `;
-
   document.documentElement.appendChild(style);
 
   const overlay = document.createElement("div");
@@ -2235,16 +2444,19 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
   if (req?.action === "suggestionChunk") {
     if (!aiAllowedHere()) return;
+
     bumpReplyLock(STREAM_LOCK_BUMP_MS);
 
     const slot = req?.slot === "negativo" ? "negativo" : "positivo";
-    if (req.reset) setSuggestionSlot(slot, "");
+    if (req.reset) sugStartLive(slot);
+
     const txt = String(req.text || "");
-    if (txt) setSuggestionSlot(slot, txt);
+    if (txt) sugUpdateLive(slot, txt);
 
     if (isPanelOpen()) setPanelStatus("Respostas (streaming)...");
 
     if (req.done === true || req.final === true || req.isFinal === true) {
+      sugFinalizeLive(slot);
       finishReplyLock();
       setPanelStatus("Respostas prontas ✅");
       setLauncherState("ok");
@@ -2272,11 +2484,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 // =====================================================
 // Persistência: flush (full history)
 // =====================================================
-function scheduleFlushSoon() {
-  if (flushDebounceId) clearTimeout(flushDebounceId);
-  flushDebounceId = setTimeout(() => flushNow("debounce"), FLUSH_DEBOUNCE_MS);
-}
-
 function buildLatestLine() {
   return Array.from(latestBySpeaker.entries())
     .sort(([a], [b]) => a.localeCompare(b))
@@ -2292,13 +2499,11 @@ function flushNow(reason) {
   if (currentHash === lastSavedHash) return;
 
   const latestLine = buildLatestLine();
+
   try {
     setLauncherState("busy");
     safeSendMessage(
-      {
-        action: "transcriptData",
-        payload: { fullHistory: transcriptData, latestLine, filename: "" },
-      },
+      { action: "transcriptData", payload: { fullHistory: transcriptData, latestLine, filename: "" } },
       () => {
         if (chrome.runtime?.lastError) {
           console.warn("⚠️ lastError:", chrome.runtime.lastError.message);
@@ -2318,12 +2523,30 @@ function flushNow(reason) {
 }
 
 // =====================================================
+// ✅ Capture dedupe por DOM node (evita reler o mesmo caption)
+// =====================================================
+const _nodeLastCaptured = new WeakMap();
+
+function appendOncePerNode(node, speaker, text, origin) {
+  const sp = normalizeSpacesOneLine(speaker || "");
+  const tx = normalizeSpacesOneLine(text || "");
+  if (!tx) return;
+
+  const sig = `${sp}||${tx}`;
+  if (node) {
+    const prev = _nodeLastCaptured.get(node);
+    if (prev === sig) return;
+    _nodeLastCaptured.set(node, sig);
+  }
+  appendNewTranscript(sp, tx, origin);
+}
+
+// =====================================================
 // ✅ Teams helpers (speaker + text)
 // =====================================================
 function cleanCaptionText(t) {
   const s = String(t || "").replace(/\u00A0/g, " ").trim();
   if (!s) return "";
-
   if (/^\s*RTT\b/i.test(s)) return "";
   if (/Pol[ií]tica de Privacidade/i.test(s)) return "";
   if (/Digite uma mensagem/i.test(s)) return "";
@@ -2332,7 +2555,6 @@ function cleanCaptionText(t) {
   if (/Digita(ç|c)ão\s*RTT/i.test(s)) return "";
   if (/texto\s+em\s+tempo\s+real/i.test(s)) return "";
   if (/real[-\s]*time\s+text/i.test(s)) return "";
-
   return s;
 }
 
@@ -2397,6 +2619,7 @@ function collectLeafTexts(root) {
     if (t) out.push(t);
     n = tw.nextNode();
   }
+
   return out.filter(Boolean);
 }
 
@@ -2413,7 +2636,7 @@ function extractMessageFromRoot(root, speaker) {
 
   if (!texts.length) return "";
 
-  // ✅ FIX: dedupe por texto + remove fragments contidos em maiores
+  // dedupe + remove fragments contidos em maiores
   const seen = new Set();
   const uniq = [];
   for (const t of texts) {
@@ -2422,27 +2645,26 @@ function extractMessageFromRoot(root, speaker) {
     seen.add(k);
     uniq.push(t);
   }
+
   texts = uniq.sort((a, b) => b.length - a.length);
 
   const filtered = [];
   for (const t of texts) {
     const tk = normTextKey(t);
-    if (filtered.some((x) => normTextKey(x).includes(tk) && normTextKey(x).length >= tk.length + 6)) continue;
+    if (filtered.some((x) => normTextKey(x).includes(tk) && normTextKey(x).length >= tk.length + 6))
+      continue;
     filtered.push(t);
   }
+
   texts = filtered;
 
   let best = texts[0] || "";
-
-  // só junta se realmente agrega (não “duplicar”)
   if (texts.length > 1) {
     const joined = normalizeSpacesOneLine(texts.join(" "));
     if (joined.length > best.length && joined.length < best.length * 1.6) best = joined;
   }
 
-  // ✅ FIX: colapsa eco dentro do próprio texto
   best = collapseTeamsRepeats(best);
-
   return best;
 }
 
@@ -2458,39 +2680,21 @@ function splitSpeakerInline(text) {
   return { speaker: "", text: s };
 }
 
-// ✅ quebra "Teams • Fulano: ... Teams • Ciclano: ..."
-function splitTeamsInlineTurns(raw) {
-  const s = normalizeSpacesOneLine(raw);
-  if (!/Teams\s*[•·-]/i.test(s) || s.indexOf(":") < 0) return null;
-  const re =
-    /Teams\s*[•·-]\s*([^:]{1,80}?)\s*:\s*([\s\S]*?)(?=\s*Teams\s*[•·-]\s*[^:]{1,80}?\s*:|$)/gi;
-  const out = [];
-  let m;
-  while ((m = re.exec(s)) !== null) {
-    const sp = normalizeSpacesOneLine(m[1]);
-    const msg = normalizeSpacesOneLine(m[2]);
-    if (!sp || !msg) continue;
-    out.push({ speaker: sp, text: msg });
-  }
-  return out.length ? out : null;
-}
-
 // =====================================================
 // Append (linha nova)
 // =====================================================
 function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
-  speaker = normalizeSpacesOneLine(speaker || "Desconhecido");
+  speaker = normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL);
   origin = normalizeSpacesOneLine(origin || "Unknown");
+
   const originLower = origin.toLowerCase();
 
-  // ✅ sempre 1 linha
   let cleanTextRaw = normalizeSpacesOneLine(fullText);
   if (!cleanTextRaw) return;
 
-  // ✅ Teams: colapsa eco antes de qualquer coisa (resolve “acúmulo” do print)
   if (originLower === "teams") cleanTextRaw = collapseTeamsRepeats(cleanTextRaw);
 
-  // ✅ Teams: multi-turno no mesmo bloco -> quebra
+  // Teams: multi-turn inline -> quebra
   if (!_alreadySplit && originLower === "teams") {
     const turns = splitTeamsInlineTurns(cleanTextRaw);
     if (turns && turns.length) {
@@ -2499,9 +2703,8 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
     }
   }
 
-  // ✅ fallback de speaker desconhecido
+  // fallback speaker
   speaker = guessSpeakerIfUnknown(speaker);
-
   if (!isUnknownSpeaker(speaker)) {
     noteNonUnknownSpeaker(speaker);
     if (isMe(speaker)) addMyName(speaker);
@@ -2512,6 +2715,7 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   const cleanText = cleanTextRaw;
   if (isJunkCaptionText(cleanText)) return;
 
+  // dedupe hard
   const key = `${origin}::${speaker}::${cleanText}`;
   if (seenKeys.has(key)) return;
   seenKeys.add(key);
@@ -2522,16 +2726,15 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
 
   let newContent = cleanText;
 
-  // ✅ delta: só adiciona o que “cresceu”
+  // delta guard
   if (prevLine && cleanText.startsWith(prevLine)) {
     const remainder = normalizeSpacesOneLine(cleanText.slice(prevLine.length));
 
-    // ✅ FIX CRÍTICO: Teams eco = remainder começa com prevLine -> NÃO reapenda
+    // Teams eco: remainder parece o prevLine -> não reapenda
     if (originLower === "teams") {
       const remK = normTextKey(remainder);
       const prevK = normTextKey(prevLine);
       if (remK && prevK && (remK.startsWith(prevK) || prevK.startsWith(remK))) {
-        // atualiza o last full e sai
         lastLineByKey.set(kOS, cleanText);
         return;
       }
@@ -2540,15 +2743,12 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
     newContent = remainder;
   }
 
-  // sempre atualiza last full
   lastLineByKey.set(kOS, cleanText);
-
   if (!newContent) return;
 
-  // ✅ se já foi corrigido há pouco, não reapenda
   if (isRecentlyFixedText(origin, speaker, newContent)) return;
 
-  // ✅ Teams: pontuação isolada -> cola no final da última linha
+  // Teams: pontuação isolada cola na última
   if (originLower === "teams" && isOnlyPunctDelta(newContent)) {
     const oldSingle = lastSingleLineByKey.get(kOS);
     if (!oldSingle) return;
@@ -2564,39 +2764,44 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
     return;
   }
 
-  // ✅ Teams: mata tokens curtos sem pontuação
+  // Teams: mata tokens curtos sem pontuação
   if (originLower === "teams") {
     const t = String(newContent || "").trim();
     if (t.length < TEAMS_RTT_MIN_CHARS && !hasFinalPunct(t)) return;
   }
 
-  // ✅ DEDUPE por (origin + texto), preferindo speaker conhecido
+  // dedupe curto por texto (origin + texto), preferindo speaker conhecido
   const textKey = `${origin}||${normTextKey(newContent)}`;
   const now = Date.now();
   const prev = recentText.get(textKey);
+
   if (prev && now - prev.ts < TEXT_DEDUP_MS) {
     const prevUnknown = isUnknownSpeaker(prev.speaker);
     const curUnknown = isUnknownSpeaker(speaker);
+
     if (normName(prev.speaker) === normName(speaker)) {
       prev.ts = now;
       recentText.set(textKey, prev);
       return;
     }
+
     if (!prevUnknown && curUnknown) {
       prev.ts = now;
       recentText.set(textKey, prev);
       return;
     }
+
     if (prevUnknown && !curUnknown) {
       const singleLineNew = `🎤 ${origin}: ${speaker}: ${newContent}`;
       replaceLastLineInCaches(prev.line, singleLineNew);
       trimHistoryIfNeeded();
       lastSingleLineByKey.set(kOS, singleLineNew);
+
       try {
         latestBySpeaker.delete(prev.speaker);
       } catch {}
-      recentText.set(textKey, { ts: now, speaker, line: singleLineNew });
 
+      recentText.set(textKey, { ts: now, speaker, line: singleLineNew });
       markTranscriptActivity();
       scheduleFlushSoon();
       return;
@@ -2612,15 +2817,7 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   appendPanelTranscriptLine(singleLine);
 
   recentText.set(textKey, { ts: Date.now(), speaker, line: singleLine });
-
-  if (recentText.size > 4000) {
-    const cutoff = Date.now() - TEXT_DEDUP_MS * 3;
-    for (const [k, v] of recentText.entries()) {
-      if (!v || v.ts < cutoff) recentText.delete(k);
-      if (recentText.size <= 2500) break;
-    }
-    if (recentText.size > 6000) recentText.clear();
-  }
+  if (recentText.size > 6000) recentText.clear();
 
   const previous = latestBySpeaker.get(speaker) || "";
   latestBySpeaker.set(speaker, previous ? `${previous} ${newContent}` : newContent);
@@ -2638,7 +2835,7 @@ const captureMeet = () => {
     const text = line.innerText?.trim();
     if (!text) return;
     const speaker =
-      line.closest(".nMcdL")?.querySelector("span.NWpY1d")?.innerText?.trim() || "Desconhecido";
+      line.closest(".nMcdL")?.querySelector("span.NWpY1d")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
     appendOncePerNode(line, speaker, text, "Meet");
   });
 };
@@ -2649,9 +2846,8 @@ const captureTeamsOld = () => {
     const text = cleanCaptionText(caption.innerText);
     if (!text) return;
     const speaker =
-      cleanCaptionText(
-        caption.closest("[data-focuszone-id]")?.querySelector(".ui-chat__message__author")?.innerText
-      ) || "Desconhecido";
+      cleanCaptionText(caption.closest("[data-focuszone-id]")?.querySelector(".ui-chat__message__author")?.innerText) ||
+      UNKNOWN_SPEAKER_LABEL;
     appendOncePerNode(caption, speaker, text, "Teams");
   });
 };
@@ -2665,17 +2861,21 @@ const captureTeamsRTT = () => {
     document.querySelector('[role="textbox"][aria-label*="tempo real"], [role="textbox"][aria-label*="real time"]');
 
   const scope = rttHint?.closest('[data-tid*="real-time-text"]') || rttHint?.parentElement || document;
+
   const authorEls = scope.querySelectorAll('span[data-tid="author"]');
   if (!authorEls.length) return;
 
   tdbg("RTT authors:", authorEls.length);
+
   for (const authorEl of authorEls) {
-    const speaker = cleanCaptionText(authorEl.innerText) || "Desconhecido";
+    const speaker = cleanCaptionText(authorEl.innerText) || UNKNOWN_SPEAKER_LABEL;
+
     let root =
       authorEl.closest(".fui-ChatMessageCompact") ||
       authorEl.closest('[role="listitem"]') ||
       authorEl.closest("li") ||
       authorEl.closest("div");
+
     if (!root) continue;
     if (root.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
 
@@ -2685,6 +2885,7 @@ const captureTeamsRTT = () => {
       msg = extractMessageFromRoot(cur, speaker);
       cur = cur.parentElement;
     }
+
     msg = cleanCaptionText(msg);
     if (!msg) continue;
 
@@ -2703,14 +2904,17 @@ const captureTeamsCaptionsV2 = () => {
     wrapper.querySelector('[data-tid="closed-caption-v2-virtual-list-content"]') || wrapper;
 
   const authorEls = list.querySelectorAll('span[data-tid="author"]');
+
   if (authorEls && authorEls.length) {
     for (const authorEl of authorEls) {
-      const speaker = cleanCaptionText(authorEl.innerText) || "Desconhecido";
+      const speaker = cleanCaptionText(authorEl.innerText) || UNKNOWN_SPEAKER_LABEL;
+
       let root =
         authorEl.closest(".fui-ChatMessageCompact") ||
         authorEl.closest('[role="listitem"]') ||
         authorEl.closest("div") ||
         authorEl.parentElement;
+
       if (!root) continue;
       if (root.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
 
@@ -2730,14 +2934,16 @@ const captureTeamsCaptionsV2 = () => {
       msg = cleanCaptionText(msg);
       if (!msg) continue;
 
-      // ✅ FIX: sempre dedupe por node
       appendOncePerNode(root || authorEl, speaker, msg, "Teams");
     }
     return;
   }
 
   // fallback: itens
-  const items = list.querySelectorAll('[role="listitem"], [data-tid*="closed-caption"], .ui-box, .fui-ChatMessageCompact');
+  const items = list.querySelectorAll(
+    '[role="listitem"], [data-tid*="closed-caption"], .ui-box, .fui-ChatMessageCompact'
+  );
+
   for (const item of items) {
     if (item.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
 
@@ -2753,9 +2959,8 @@ const captureTeamsCaptionsV2 = () => {
     const speaker =
       cleanCaptionText(item.querySelector?.('span[data-tid="author"]')?.innerText) ||
       cleanCaptionText(inline.speaker) ||
-      "Desconhecido";
+      UNKNOWN_SPEAKER_LABEL;
 
-    // ✅ FIX CRÍTICO: era appendNewTranscript direto -> causava acúmulo
     appendOncePerNode(item, speaker, msg, "Teams");
   }
 };
@@ -2768,8 +2973,7 @@ const captureTeams = () => {
 
 const captureSlack = () => {
   document.querySelectorAll(".p-huddle_event_log__base_event").forEach((event) => {
-    const speaker =
-      event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || "Desconhecido";
+    const speaker = event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
     const text = event.querySelector(".p-huddle_event_log__transcription")?.innerText?.trim();
     if (text) appendOncePerNode(event, speaker, text, "Slack");
   });
