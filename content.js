@@ -1372,6 +1372,19 @@ function sugDelete(slot, id) {
   }
 }
 
+// ✅ Throttle de render (não trava a UI durante streaming)
+const SUG_RENDER_THROTTLE_MS = 120;
+const __mt_sugRenderTimer = { positivo: 0, negativo: 0 };
+
+function sugRenderThrottled(slot) {
+  slot = sugSlotNorm(slot);
+  if (__mt_sugRenderTimer[slot]) return;
+  __mt_sugRenderTimer[slot] = setTimeout(() => {
+    __mt_sugRenderTimer[slot] = 0;
+    sugRender(slot);
+  }, SUG_RENDER_THROTTLE_MS);
+}
+
 function sugRender(slot) {
   slot = sugSlotNorm(slot);
   const host = sugHost(slot);
@@ -1522,7 +1535,7 @@ function sugUpdateLive(slot, text) {
 
   sugPrune(slot);
   saveSugHistorySoon();
-  sugRender(slot);
+  sugRenderThrottled(slot);
 }
 
 function sugFinalizeLive(slot) {
@@ -2838,6 +2851,14 @@ function generateRepliesForLine(line) {
 // Viewer open (tab / side panel)
 // =====================================================
 function openViewerTab() {
+  // ✅ abre direto (mais confiável durante streaming pesado)
+  try {
+    const url = chrome.runtime.getURL("viewer.html");
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  } catch {}
+
+  // fallback antigo
   safeSendMessage({ action: "openViewerTab" }, () => {
     if (chrome.runtime?.lastError) {
       console.warn("⚠️ Falha ao abrir viewer via background:", chrome.runtime.lastError.message);
