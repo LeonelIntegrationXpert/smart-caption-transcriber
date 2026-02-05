@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # server.py — FastAPI chain:
-# 1) runs ask-llama.ps1 (streaming)  [8B]
+# 1) calls llama.cpp /completion directly (streaming)  [8B stage-1]
 # 2) captures its full output (draft)
 # 3) feeds draft + clean prompt into Ollama 120b (streaming)
 #
 # Endpoints:
-#  - POST /ask_llama     -> streams ONLY stage-1 (PowerShell)
-#  - POST /ask           -> streams ONLY 120b corrector (as before)
-#  - POST /ask_me        -> CHAIN positive (ps1 -> 120b)  ✅ stage1 stream DEFAULT ON
-#  - POST /ask_me_neg    -> CHAIN negative (ps1 -> 120b)  ✅ stage1 stream DEFAULT ON
-#  - /health, /context*, /buffer (as before)
+#  - POST /ask_llama     -> streams ONLY stage-1 (llama.cpp /completion)
+#  - POST /ask           -> streams ONLY 120b corrector
+#  - POST /ask_me        -> CHAIN positive (stage1 -> 120b) ✅ stage1 stream DEFAULT ON
+#  - POST /ask_me_neg    -> CHAIN negative (stage1 -> 120b) ✅ stage1 stream DEFAULT ON
+#  - /health, /context*, /buffer
+#
+# ✅ FIXES INCLUDED:
+# - Stage1 (8B) greeting/thanks/bye/how-are-you handled deterministically
+# - Stage1 rules: POSITIVE vs NEGATIVE
+# - Stage2 prompts: explicit MOOD + NEVER ask questions / NEVER use '?', no sign-offs
+# - Parser: ignores [stage1]/[stage2] markers + favors explicit "Interviewer:" lines
+# - is_code_like(): stops treating URL/path as code
 
 import os
 import sys
@@ -31,7 +38,7 @@ REQUIRED = ["fastapi", "uvicorn[standard]", "requests", "pydantic"]
 
 def _pip_install(pkgs):
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", *pkgs]
-    print("📦 Instalando dependências:", " ".join(pkgs), flush=True)
+    print("📦 Installing dependencies:", " ".join(pkgs), flush=True)
     subprocess.check_call(cmd)
 
 
@@ -50,7 +57,7 @@ def ensure_deps():
 ensure_deps()
 
 # =========================
-# ✅ Imports (após install)
+# ✅ Imports (after install)
 # =========================
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -78,19 +85,26 @@ STREAM_HEADERS = {
 BASE_DIR = Path(__file__).parent
 INDEX_PATH = BASE_DIR / "index.html"
 
-# ---- Stage 1 (PowerShell / ask-llama.ps1)
-POWERSHELL = os.getenv("POWERSHELL_EXE", "powershell.exe")
-SCRIPT_DEFAULT = Path(os.getenv("LLAMA_PS1", str(BASE_DIR / "ask-llama.ps1")))
-
+# ---- Stage 1 (llama.cpp /completion)
 LLAMA_DEFAULT_URL = os.getenv("LLAMA_URL", "http://localhost:8080/completion")
-LLAMA_DEFAULT_NPREDICT = int(os.getenv("LLAMA_NPREDICT", "220"))  # ✅ default menor
+LLAMA_DEFAULT_NPREDICT = int(os.getenv("LLAMA_NPREDICT", "220"))
 LLAMA_DEFAULT_TEMPERATURE = float(os.getenv("LLAMA_TEMPERATURE", "0.30"))
+LLAMA_DEFAULT_TOPK = int(os.getenv("LLAMA_TOPK", "40"))
 LLAMA_DEFAULT_TOPP = float(os.getenv("LLAMA_TOPP", "0.90"))
+LLAMA_DEFAULT_TYPICALP = float(os.getenv("LLAMA_TYPICALP", "1.0"))
+LLAMA_DEFAULT_MINP = float(os.getenv("LLAMA_MINP", "0.05"))
+LLAMA_DEFAULT_REPEAT_LAST_N = int(os.getenv("LLAMA_REPEAT_LAST_N", "64"))
+LLAMA_DEFAULT_REPEAT_PENALTY = float(os.getenv("LLAMA_REPEAT_PENALTY", "1.0"))
+LLAMA_DEFAULT_PRESENCE_PENALTY = float(os.getenv("LLAMA_PRESENCE_PENALTY", "0.0"))
+LLAMA_DEFAULT_FREQUENCY_PENALTY = float(os.getenv("LLAMA_FREQUENCY_PENALTY", "0.0"))
 
-# ✅ clamps/caps específicos do stage1 (pra evitar textão)
+STAGE1_CONNECT_TIMEOUT = float(os.getenv("STAGE1_CONNECT_TIMEOUT", "5"))
+STAGE1_TIMEOUT = float(os.getenv("STAGE1_TIMEOUT", "120"))
+
+# ---- Stage 1 clamps/caps (avoid long output)
 STAGE1_MAX_NPREDICT = int(os.getenv("STAGE1_MAX_NPREDICT", "220"))
-STAGE1_STREAM_MAX_BYTES = int(os.getenv("STAGE1_STREAM_MAX_BYTES", "8192"))  # corta o stream do 8B se passar disso
-STAGE1_DRAFT_MAX_CHARS = int(os.getenv("STAGE1_DRAFT_MAX_CHARS", "600"))  # draft pro 120B
+STAGE1_STREAM_MAX_BYTES = int(os.getenv("STAGE1_STREAM_MAX_BYTES", "2048"))  # preview cap
+STAGE1_DRAFT_MAX_CHARS = int(os.getenv("STAGE1_DRAFT_MAX_CHARS", "480"))
 
 # ---- Stage 2 (Ollama / 120b)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
@@ -101,7 +115,7 @@ CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "10"))
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))
 MAX_DRAFT_CHARS = int(os.getenv("MAX_DRAFT_CHARS", "6000"))
 
-API_KEY = os.getenv("API_KEY", "").strip()  # opcional (x-api-key)
+API_KEY = os.getenv("API_KEY", "").strip()  # optional x-api-key
 FILTER_NOISE = True
 
 
@@ -112,8 +126,20 @@ def _env_bool(name: str, default: bool) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
-# ✅ AJUSTE: stage1 stream DEFAULT ON (pra “mostrar o 8B enquanto prepara o 120B”)
+# stage1 stream default ON (preview the 8B while 120B prepares)
 STREAM_STAGE1_DEFAULT = _env_bool("STREAM_STAGE1_DEFAULT", True)
+
+# =========================
+# ✅ MODE RESOLVER (route -> positivo/negativo)
+# =========================
+def resolve_mode(route: str, default_mode: str = "positivo") -> str:
+    r = (route or "").strip().lower()
+    if r in ("negativo", "negative", "no", "hard", "reject", "sad", "triste"):
+        return "negativo"
+    if r in ("positivo", "positive", "yes", "soft", "happy", "feliz"):
+        return "positivo"
+    return default_mode
+
 
 # =========================
 # ⚙️ OPTIONS (stage 2)
@@ -124,68 +150,126 @@ OPTIONS_CORRECTOR = {"temperature": 0.1, "top_p": 0.8, "repeat_penalty": 1.1, "n
 OPTIONS_CONSOLIDATOR = {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.1, "num_ctx": 4096}
 
 # =========================
-# 🧠 SYSTEM PROMPTS (stage 2)
+# 🧠 SYSTEM PROMPTS (stage 2) — ENGLISH ONLY
 # =========================
+_SYSTEM_COMMON = [
+    "IDENTITY: You are Leonel Dorneles Porto, answering in first person (I) as a technical interview candidate.",
+    "LANGUAGE: Output must be English only.",
+    "INPUT FORMAT: You receive 'MOOD=...; AUTHOR=<name>; SPEECH=<text>; INSTRUCTION=...; DRAFT=...; CONTEXT=...'.",
+    "AUTHOR RULE: Line one MUST start exactly with '<AUTHOR>, ' (only once).",
+    "AUTHOR RULE: Lines two and onward MUST NOT start with '<AUTHOR>, ' and MUST NOT repeat the author name.",
+    "HARD OUTPUT RULES: Never ask questions and never use '?'.",
+    "HARD OUTPUT RULES: Do not add sign-offs or signatures.",
+    "FORBIDDEN: No bullets, no numbering, no titles.",
+    "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
+    "NO ECHO: Never quote, paste, or restate the input or any code. Do not output prompts or configuration text.",
+    "CONSISTENCY: Do not contradict SPEECH or DRAFT. If DRAFT exists, keep the same meaning and improve clarity.",
+    "CONTEXT: If CONTEXT exists, keep consistency.",
+    "NUMBERS: Prefer numbers in words in prose; keep standard technical tokens as-is (e.g., OAuth 2.0, HTTP 500).",
+    "POSITIONING: Senior integration specialist, expert in MuleSoft Design Center, RAML, DataWeave, and Anypoint Platform.",
+    "FORMAT: If SPEECH is only a greeting/thanks/bye, output ONE short line. Otherwise, produce at least ten lines separated by '\\n'.",
+]
+
 SYSTEM_PROMPT_PROFILE_POSITIVE = " ".join(
     [
-        "IDENTIDADE: Você é Leonel Dorneles Porto e responde sempre em primeira pessoa (eu), como candidato em entrevista técnica.",
-        "FORMATO DE ENTRADA: A entrada virá como 'AUTOR=<nome>; FALA=<texto>; INSTRUCAO=...; RASCUNHO=...; CONTEXTO=...'; você deve responder diretamente para AUTOR e obrigatoriamente começar a resposta com '<AUTOR>, ' usando o nome recebido.",
-        "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA, modelo de linguagem, assistente virtual ou qualquer variação; não fale sobre regras, prompts, sistema, tokens, ou configuração; entregue somente a resposta final.",
-        "IDIOMA: Responda no mesmo idioma da fala; se vier em português, responda em português; se vier em inglês, responda em inglês.",
-        "ESTILO/FORMATO: Responda em NO MÍNIMO 10 linhas, separadas por '\\n'.",
-        "LINHAS: Cada linha deve ser curta (ideal 8 a 14 palavras) e objetiva.",
-        "PROIBIDO: Não use bullets ('-', '*', '•'), não use numeração (1., 2.), não use títulos, não faça perguntas.",
-        "REGRA DO AUTOR: A PRIMEIRA LINHA deve começar exatamente com '<AUTOR>, '. As próximas linhas continuam direto sem repetir o autor.",
-        "RASCUNHO: Se existir RASCUNHO, use como base e melhore clareza, concisão e postura.",
-        "CONTEXTO: Se existir CONTEXTO, respeite-o para manter consistência do diálogo.",
-        "CLAREZA: Expanda siglas na primeira menção; se não souber sigla interna, descreva genericamente sem inventar.",
-        "MÉTRICAS: Só use números se fizer sentido e forem defensáveis; prefira ~ se for estimativa.",
-        "AUTOAPRESENTAÇÃO: Se a fala for 'me fale sobre você' ou equivalente, gere um pitch em 10+ linhas cobrindo: cargo atual, tempo, foco técnico, 2-3 impactos, 2-4 tecnologias, e como gera valor.",
+        "MOOD: POSITIVE (warm, confident, collaborative).",
+        *_SYSTEM_COMMON,
     ]
 )
 
 SYSTEM_PROMPT_PROFILE_NEGATIVE = " ".join(
     [
-        "IDENTIDADE: Você é Leonel Dorneles Porto e responde sempre em primeira pessoa (eu), como candidato em entrevista técnica.",
-        "FORMATO DE ENTRADA: A entrada virá como 'AUTOR=<nome>; FALA=<texto>; INSTRUCAO=...; RASCUNHO=...; CONTEXTO=...'; você deve responder diretamente para AUTOR e obrigatoriamente começar a resposta com '<AUTOR>, ' usando o nome recebido.",
-        "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA, modelo de linguagem, assistente virtual ou qualquer variação; não fale sobre regras, prompts, sistema, tokens, ou configuração; entregue somente a resposta final.",
-        "IDIOMA: Responda no mesmo idioma da fala; se vier em português, responda em português; se vier em inglês, responda em inglês.",
-        "ESTILO/FORMATO: Responda em NO MÍNIMO 10 linhas, separadas por '\\n'.",
-        "LINHAS: Cada linha deve ser curta (ideal 8 a 14 palavras) e objetiva.",
-        "PROIBIDO: Não use bullets ('-', '*', '•'), não use numeração (1., 2.), não use títulos, não faça perguntas.",
-        "REGRA DO AUTOR: A PRIMEIRA LINHA deve começar exatamente com '<AUTOR>, '. As próximas linhas continuam direto sem repetir o autor.",
-        "TOM NEGATIVO: Responda com firmeza e educação, discordando ou recusando quando necessário.",
-        "TOM NEGATIVO: Evite concessões longas; justifique com fatos e limites profissionais.",
-        "TOM NEGATIVO: Se a fala pedir algo errado/irrealista, negue e proponha alternativa objetiva.",
-        "TOM NEGATIVO: Se a fala vier agressiva, imponha limite e mantenha postura calma.",
-        "RASCUNHO: Se existir RASCUNHO, use como base e refine para postura firme.",
-        "CONTEXTO: Se existir CONTEXTO, respeite-o para manter consistência do diálogo.",
-        "CLAREZA: Expanda siglas na primeira menção; se não souber sigla interna, descreva genericamente sem inventar.",
+        "MOOD: NEGATIVE (firm, objective, sets boundaries; not rude).",
+        *_SYSTEM_COMMON,
+        "TONE: Firm, polite, objective. Refuse or disagree when needed.",
     ]
 )
 
 SYSTEM_PROMPT_CORRECTOR = " ".join(
     [
-        "MODO: Você é um corretor gramatical e ortográfico.",
-        "TAREFA: Corrigir mantendo significado/tom/idioma; melhorar pontuação; preservar termos técnicos e códigos; devolver em uma única linha.",
-        "SAÍDA: Retorne SOMENTE o texto corrigido, em UMA ÚNICA LINHA, sem explicações.",
-        "ANTI-META: Nunca diga que você é ChatGPT, OpenAI, IA ou modelo; não explique regras.",
+        "MODE: You are a grammar and spelling corrector.",
+        "TASK: Fix text while preserving meaning, tone, and language; improve punctuation; preserve technical terms and code.",
+        "OUTPUT: Return ONLY the corrected text in a single line, no explanations.",
+        "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
     ]
 )
 
 SYSTEM_PROMPT_CONSOLIDATOR = " ".join(
     [
-        "MODO: Você é um consolidador de contexto para entrevista técnica.",
-        "TAREFA: A partir de mensagens limpas (AUTOR: TEXTO), gere um contexto consolidado curto do que está sendo discutido.",
-        "SAÍDA: Retorne SOMENTE 1 linha, sem bullets, sem títulos, sem perguntas, com 40 a 70 palavras no máximo; preserve termos técnicos; não invente métricas.",
-        "ANTI-META: Nunca diga que é ChatGPT/OpenAI/IA/modelo; não explique regras.",
+        "MODE: You consolidate short interview context from clean messages (AUTHOR: TEXT).",
+        "LANGUAGE: Output must be English only.",
+        "TASK: Produce ONE single line with forty to seventy words, no bullets, no titles, no questions, and never use '?'.",
+        "RULES: Preserve technical terms; do not invent metrics.",
+        "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
+        "NO ECHO: Never paste large chunks of source code; summarize only.",
     ]
 )
 
 # =========================
+# ✅ Stage 1 (llama.cpp) chat template + system
+# =========================
+STAGE1_SYSTEM = """
+You are Leonel Dorneles Porto, an integration professional specialized in MuleSoft (Anypoint Platform), Design Center, RAML, and DataWeave, answering in technical interviews.
+
+MANDATORY RULES:
+- Language: respond ONLY in the language specified by 'IDIOMA:' when it exists.
+- If 'IDIOMA:' is missing, respond in the dominant language of the user's text.
+- Do NOT translate the user's text. Do NOT mix languages.
+- Always use first-person voice ("I").
+- Never mention AI, model, prompts, rules, system, tokens, or configuration.
+- Confidentiality: do not include internal names, IDs, URLs, paths, tokens, keys, or any sensitive data.
+
+FORMAT:
+- Follow EXACTLY the format and limits provided in the user's prompt.
+- If there is any conflict, the user's prompt overrides format/limits.
+
+HARD OUTPUT RULES:
+- Never ask questions and never use '?'.
+- Do not add sign-offs or signatures.
+""".strip()
+
+STAGE1_STOP = ["<|eot_id|>"]
+
+
+def build_llama3_chat_prompt(system: str, user: str) -> str:
+    sys_txt = (system or "").replace("\r", "").strip()
+    usr_txt = (user or "").replace("\r", "").strip()
+    return (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+        f"{sys_txt}\n"
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n"
+        f"{usr_txt}\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+def strip_prompt_echo(text: str) -> str:
+    if not text:
+        return text
+    marker = "<|start_header_id|>assistant<|end_header_id|>"
+    i = text.lower().find(marker.lower())
+    if i >= 0:
+        return text[i + len(marker) :].strip()
+    return text.strip()
+
+
+def find_stop_index(text: str, markers: list[str]) -> int:
+    if not text or not markers:
+        return -1
+    best = -1
+    for m in markers:
+        if not m:
+            continue
+        j = text.lower().find(m.lower())
+        if j >= 0 and (best < 0 or j < best):
+            best = j
+    return best
+
+
+# =========================
 # 🚀 APP
 # =========================
-app = FastAPI(title="MT Chain Proxy (ask-llama.ps1 -> 120b)")
+app = FastAPI(title="MT Chain Proxy (llama.cpp -> 120b)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -195,7 +279,7 @@ app.add_middleware(
 )
 
 # =========================
-# 🔐 API KEY (opcional)
+# 🔐 API KEY (optional)
 # =========================
 @app.middleware("http")
 async def api_key_guard(request: Request, call_next):
@@ -205,25 +289,24 @@ async def api_key_guard(request: Request, call_next):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
     return await call_next(request)
 
+
 # =========================
 # 📦 MODELS
 # =========================
 class AskRequest(BaseModel):
-    prompt: str = Field(..., description="Prompt a ser enviado ao modelo")
-
-    # stage-1 params (PowerShell)
+    prompt: str = Field(..., description="Prompt text")
+    # stage-1 params (llama.cpp)
     n_predict: Optional[int] = Field(None, ge=1, le=32768)
     temperature: Optional[float] = Field(None, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(None, ge=0.0, le=1.0)
     url: Optional[str] = None
-
-    # ✅ DEFAULT ON
+    # default ON
     stream_stage1: bool = Field(
         STREAM_STAGE1_DEFAULT,
-        description="Se true, envia o stream do stage-1 (8B) antes do 120b",
+        description="If true, streams stage-1 (8B) before stage-2 (120B)",
     )
+    route: Optional[str] = Field(None, description="Compat: send 'negative'/'positive' to force mood")
 
-    route: Optional[str] = Field(None, description="Compat: pode mandar 'negativo' para forçar ask_me_neg")
 
 # =========================
 # 🧠 Helpers: str/bytes + SSE
@@ -237,16 +320,110 @@ def _to_str(x) -> str:
         return x
     return str(x)
 
+
 def _maybe_strip_sse_prefix(line) -> str:
     s = _to_str(line).strip()
     if s.startswith("data:"):
         s = s[5:].strip()
     return s
 
+
 # =========================
-# 🧠 PARSER (Teams/Meet)
+# 🧠 Greeting/thanks/bye detection (Stage1 deterministic)
+# =========================
+_IDIOMA_RE = re.compile(r"\bIDIOMA\s*:\s*([A-Za-z_-]+)\b", re.IGNORECASE)
+
+_GREET_ONLY_RE = re.compile(
+    r"^\s*(hi|hello|hey|yo|good\s+morning|good\s+afternoon|good\s+evening|"
+    r"oi|ol[aá]|eae|ea[ií]|bom\s+dia|boa\s+tarde|boa\s+noite)\s*[!.\s🙏😊😄🙂]*$",
+    re.IGNORECASE,
+)
+_THANKS_ONLY_RE = re.compile(
+    r"^\s*(thanks|thank\s+you|thx|tks|valeu|obrigado|obrigada|brigad[ao])\s*[!.\s🙏😊😄🙂]*$",
+    re.IGNORECASE,
+)
+_BYE_ONLY_RE = re.compile(
+    r"^\s*(bye|goodbye|see\s+you|cya|see\s+ya|tchau|flw|até\s+mais|ate\s+mais|até)\s*[!.\s🙏😊😄🙂]*$",
+    re.IGNORECASE,
+)
+_HOW_ARE_YOU_ONLY_RE = re.compile(
+    r"^\s*("
+    r"how\s+are\s+you|how\s+are\s+u|how\s+r\s+u|how\s+ya\s+doing|how\s+is\s+it\s+going|"
+    r"como\s+voce\s+ta|como\s+vc\s+ta|como\s+você\s+tá|como\s+você\s+está|como\s+vc\s+est[aá]|"
+    r"tudo\s+bem|td\s+bem"
+    r")\s*[!.\s🙏😊😄🙂]*$",
+    re.IGNORECASE,
+)
+
+
+def _hint_lang_from_text(text: str) -> str:
+    t = (text or "").lower()
+    m = _IDIOMA_RE.search(text or "")
+    if m:
+        val = (m.group(1) or "").lower()
+        if "pt" in val or "port" in val:
+            return "pt"
+        if "en" in val or "eng" in val:
+            return "en"
+    pt_markers = [" oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "obrig", "valeu", "tchau", "até", "ate"]
+    if any(p.strip() in t for p in pt_markers) or any(ch in t for ch in "ãõáàâéêíóôúç"):
+        return "pt"
+    return "en"
+
+
+def _is_greetish_only(text: str) -> bool:
+    s = text or ""
+    return bool(_GREET_ONLY_RE.match(s) or _HOW_ARE_YOU_ONLY_RE.match(s))
+
+
+def _is_thanks_only(text: str) -> bool:
+    return bool(_THANKS_ONLY_RE.match(text or ""))
+
+
+def _is_bye_only(text: str) -> bool:
+    return bool(_BYE_ONLY_RE.match(text or ""))
+
+
+def _stage1_canned(author: str, speech: str, mode: str) -> str:
+    lang = _hint_lang_from_text(speech)
+    a = (author or "Interviewer").strip() or "Interviewer"
+    m = (mode or "positivo").strip().lower()
+
+    # HARD RULES: never ask questions / never use '?'
+    if _is_greetish_only(speech):
+        if lang == "pt":
+            return f"{a}, oi! Estou bem, obrigado." if m == "positivo" else f"{a}, oi. Estou bem."
+        return f"{a}, hi! I'm doing well, thanks." if m == "positivo" else f"{a}, hi. I'm doing well."
+
+    if _is_thanks_only(speech):
+        if lang == "pt":
+            return f"{a}, de nada. Estou à disposição." if m == "positivo" else f"{a}, de nada."
+        return f"{a}, you're welcome. Happy to help." if m == "positivo" else f"{a}, you're welcome."
+
+    if _is_bye_only(speech):
+        if lang == "pt":
+            return f"{a}, fechado. Até mais." if m == "positivo" else f"{a}, certo. Até."
+        return f"{a}, sounds good. Talk soon." if m == "positivo" else f"{a}, okay. Take care."
+
+    return ""
+
+
+# =========================
+# 🧠 Parser + Noise/Code filters
 # =========================
 _NOISE_RE = re.compile(r"^[A-Z]{1,4}(\s*[A-Z]{1,4})*$")
+_CODE_PREFIX_RE = re.compile(
+    r"^\s*(import|from|def|class|async\s+def|const|let|var|function|public|private|package|using|#include)\b",
+    re.IGNORECASE,
+)
+_INTERVIEWER_PREFIX_RE = re.compile(r"^\s*(interviewer|entrevistador)\s*:\s*", re.IGNORECASE)
+_IGNORE_LINE_RE = re.compile(
+    r"^\s*(\[(stage1|stage2).*?\]|traceback\b|file\s+\".*?\"|during\s+handling\b|"
+    r"\[ollama_error\]|\[stage1_http_error\]|\[stage1_error\])",
+    re.IGNORECASE,
+)
+_PS_PROMPT_RE = re.compile(r"^\s*PS\s+[A-Z]:\\.*?>\s*", re.IGNORECASE)
+
 
 def is_noise_text(text: str) -> bool:
     t = (text or "").strip()
@@ -255,6 +432,42 @@ def is_noise_text(text: str) -> bool:
     if len(t) <= 4 and _NOISE_RE.fullmatch(t) is not None:
         return True
     return False
+
+
+def is_code_like(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    low = t.lower()
+
+    # natural language “question-like” should not be considered code
+    if "?" in t or low.startswith(("what ", "how ", "why ", "when ", "where ", "can ", "should ", "describe ", "explain ", "tell me ")):
+        if "```" in t or "<|begin_of_text|>" in t or "%dw" in low or "<mule" in low:
+            return True
+        return False
+
+    if t.startswith("```") or t.endswith("```"):
+        return True
+    if t.startswith("#!/"):
+        return True
+    if "<|begin_of_text|>" in t or "<|start_header_id|>" in t:
+        return True
+    if _CODE_PREFIX_RE.match(t):
+        return True
+
+    # DataWeave / XML / heavy syntax hints
+    code_tokens = ["%dw", "<mule", "</", "{", "}", "();", "=>", "==", "!=", "/*", "*/", "BEGIN:VEVENT"]
+    if any(tok in t for tok in code_tokens) and len(t) >= 60:
+        return True
+
+    # symbol density heuristic (DO NOT count "/" to avoid URL/path false positives)
+    symbols = sum(1 for ch in t if ch in "{}[]();=<>$#@\\")
+    if len(t) >= 120 and symbols >= 14:
+        return True
+
+    return False
+
 
 def _parse_teams_inline(s: str):
     if "Teams •" not in s:
@@ -272,23 +485,28 @@ def _parse_teams_inline(s: str):
     if not found:
         return None
     speaker, msg = found[-1]
-    author = "Entrevistador" if speaker.lower() in ("desconhecido", "unknown") else speaker
+    author = "Interviewer" if speaker.lower() in ("unknown", "desconhecido") else speaker
     return {"author": author, "text": msg, "raw": s}
+
 
 def parse_line_author_and_text(line: str):
     s = (line or "").strip()
     if not s or ":" not in s:
         return None
-
     p = _parse_teams_inline(s)
     if p:
         return p
+
+    # strongly prefer explicit interviewer lines
+    if _INTERVIEWER_PREFIX_RE.match(s):
+        _, rest = s.split(":", 1)
+        return {"author": "Interviewer", "text": rest.strip(), "raw": s}
 
     parts = [p.strip() for p in s.rsplit(":", 2)]
     if len(parts) == 3:
         _prefix, speaker, msg = parts
         if speaker and msg:
-            author = "Entrevistador" if speaker.lower() in ("desconhecido", "unknown") else speaker
+            author = "Interviewer" if speaker.lower() in ("unknown", "desconhecido") else speaker
             return {"author": author, "text": msg, "raw": s}
 
     author, rest = s.split(":", 1)
@@ -296,79 +514,164 @@ def parse_line_author_and_text(line: str):
     text = rest.strip()
     if not author or not text:
         return None
-    author = "Entrevistador" if author.lower() in ("desconhecido", "unknown") else author
+    author = "Interviewer" if author.lower() in ("unknown", "desconhecido") else author
     return {"author": author, "text": text, "raw": s}
+
+
+def _is_ignored_line(ln: str) -> bool:
+    s = (ln or "").strip()
+    if not s:
+        return True
+    if _IGNORE_LINE_RE.match(s):
+        return True
+    if _PS_PROMPT_RE.match(s):
+        return True
+    return False
+
 
 def extract_last_valid(raw: str):
     raw = raw or ""
-    p_inline = _parse_teams_inline(raw.strip())
-    if p_inline and (not FILTER_NOISE or not is_noise_text(p_inline["text"])):
-        return p_inline
 
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    # inline Teams
+    p_inline = _parse_teams_inline(raw.strip())
+    if p_inline:
+        if FILTER_NOISE and is_noise_text(p_inline["text"]):
+            pass
+        elif is_code_like(p_inline["text"]):
+            pass
+        else:
+            return p_inline
+
+    lines_all = [ln.strip() for ln in raw.splitlines() if ln and ln.strip()]
+    lines = [ln for ln in lines_all if not _is_ignored_line(ln)]
+
+    # pass 1: prefer explicit "Interviewer:" lines
+    for ln in reversed(lines):
+        if _INTERVIEWER_PREFIX_RE.match(ln):
+            p = parse_line_author_and_text(ln)
+            if p and not (FILTER_NOISE and is_noise_text(p["text"])) and not is_code_like(p["text"]):
+                return p
+
+    # pass 2: generic author:text heuristics
     for ln in reversed(lines):
         p = parse_line_author_and_text(ln)
         if not p:
             continue
         if FILTER_NOISE and is_noise_text(p["text"]):
             continue
+        if is_code_like(p["text"]):
+            continue
         return p
+
     return None
 
-def build_profile_user_text(raw_prompt: str, draft: str = "", context: str = "") -> str:
+
+def build_profile_user_text(raw_prompt: str, draft: str = "", context: str = "", mode: str = "positivo") -> str:
     last = extract_last_valid(raw_prompt)
     if not last:
-        author = "Entrevistador"
-        text = (raw_prompt or "").strip()
+        author = "Interviewer"
+        speech = (raw_prompt or "").strip()
     else:
-        author = last["author"]
-        text = last["text"]
+        author = (last.get("author") or "").strip() or "Interviewer"
+        speech = (last.get("text") or "").strip()
 
-    author_safe = (author or "Entrevistador").strip()
-    text_safe = (text or "").strip()
+    if author.lower() in ("unknown", "desconhecido"):
+        author = "Interviewer"
+    if is_code_like(speech):
+        speech = "No clear spoken interview question found in the input."
+    if len(speech) > 900:
+        speech = speech[:900].rstrip() + "…"
+
     draft_safe = (draft or "").replace("\r", " ").strip()
     context_safe = (context or "").replace("\r", " ").strip()
 
+    m = (mode or "positivo").strip().lower()
+    mood_tag = "NEGATIVE" if m == "negativo" else "POSITIVE"
+
     out = (
-        f"AUTOR={author_safe}; FALA={text_safe}; "
-        f"INSTRUCAO=Responda diretamente para AUTOR e comece a resposta com '{author_safe}, '; "
+        f"MOOD={mood_tag}; "
+        f"AUTHOR={author}; "
+        f"SPEECH={speech}; "
+        f"INSTRUCTION=Answer the AUTHOR. Line one starts with '{author}, ' only once; lines two and onward must not repeat the author name. "
+        f"Never ask questions and never use '?'. Do not add sign-offs or signatures. "
     )
     if draft_safe:
-        out += f"RASCUNHO={draft_safe}; "
+        out += f"DRAFT={draft_safe}; "
     if context_safe:
-        out += f"CONTEXTO={context_safe}; "
+        out += f"CONTEXT={context_safe}; "
     return out.strip()
 
-# ✅ NOVO: prompt stage1 (8B) também entende AUTOR/FALA
-STAGE1_RULES = os.getenv(
-    "STAGE1_RULES",
-    "REGRAS: 1 único parágrafo, sem quebras de linha; exatamente 1 frase curta; "
-    "no máximo 260 caracteres; não faça perguntas; não diga 'começou a entrevista' "
-    "nem 'estou pronto'; responda em primeira pessoa; idioma igual ao da FALA; "
-    "comece exatamente com '<AUTOR>, '.",
-).strip()
-
-def build_stage1_user_text(raw_prompt: str) -> str:
-    last = extract_last_valid(raw_prompt)
-    if not last:
-        author = "Entrevistador"
-        text = (raw_prompt or "").strip()
-    else:
-        author = last["author"]
-        text = last["text"]
-
-    author_safe = (author or "Entrevistador").strip()
-    text_safe = (text or "").strip()
-
-    # mesmo contrato do ask_me: AUTOR/FALA/INSTRUCAO
-    return (
-        f"AUTOR={author_safe}; FALA={text_safe}; "
-        f"INSTRUCAO=Responda diretamente para AUTOR e comece exatamente com '{author_safe}, '; "
-        f"{STAGE1_RULES}"
-    ).strip()
 
 # =========================
-# 🧠 CONTEXTO CONSOLIDADO
+# ✅ Stage1 (8B) USER INSTRUCTION — POS/NEG
+# =========================
+STAGE1_RULES_POSITIVE = os.getenv(
+    "STAGE1_RULES_POSITIVE",
+    "RULES (follow exactly): "
+    "Answer SPEECH directly and naturally with a positive, helpful tone. "
+    "Output ONE or TWO short lines separated by \\n (prefer one). "
+    "Keep total under three hundred and twenty characters. "
+    "Use first-person. "
+    "Never ask questions and never use '?'. "
+    "No meta (no AI, model, prompts, rules). "
+    "No echo: do not quote the input. "
+    "No bullets, no numbering, no brackets. "
+    "Do not add sign-offs or signatures. "
+    "If SPEECH is unclear, say you need more context in one short sentence. ",
+).strip()
+
+STAGE1_RULES_NEGATIVE = os.getenv(
+    "STAGE1_RULES_NEGATIVE",
+    "RULES (follow exactly): "
+    "Answer SPEECH directly and naturally with a firm, objective tone. "
+    "If the request is unreasonable, refuse briefly and professionally. "
+    "Output ONE or TWO short lines separated by \\n (prefer one). "
+    "Keep total under three hundred and twenty characters. "
+    "Use first-person. "
+    "Never ask questions and never use '?'. "
+    "No meta (no AI, model, prompts, rules). "
+    "No echo: do not quote the input. "
+    "No bullets, no numbering, no brackets. "
+    "Do not add sign-offs or signatures. "
+    "If SPEECH is unclear, say you need more context in one short sentence. ",
+).strip()
+
+
+def build_stage1_user_text(raw_prompt: str, mode: str) -> Tuple[str, str, str]:
+    """Returns (author, speech, stage1_user_text)."""
+    last = extract_last_valid(raw_prompt)
+    if not last:
+        author = "Interviewer"
+        speech = (raw_prompt or "").strip()
+    else:
+        author = (last.get("author") or "Interviewer").strip() or "Interviewer"
+        speech = (last.get("text") or "").strip()
+
+    if author.lower() in ("unknown", "desconhecido"):
+        author = "Interviewer"
+    if is_code_like(speech):
+        speech = "No clear spoken interview question found."
+
+    m = (mode or "positivo").strip().lower()
+    rules = STAGE1_RULES_NEGATIVE if m == "negativo" else STAGE1_RULES_POSITIVE
+    mood_tag = "NEGATIVE" if m == "negativo" else "POSITIVE"
+
+    return (
+        author,
+        speech,
+        (
+            "You are Leonel Dorneles Porto answering as a candidate in a technical interview.\n"
+            f"MOOD: {mood_tag}\n"
+            f"AUTHOR: {author}\n"
+            f"SPEECH: {speech}\n"
+            f"{rules}\n"
+            "Answer now:"
+        ).strip(),
+    )
+
+
+# =========================
+# 🧠 Context memory
 # =========================
 STATE_LOCK = threading.Lock()
 CLEAN_BUFFER = []  # [{ts, author, text}]
@@ -376,9 +679,11 @@ CONTEXT_TEXT = ""
 LAST_CONTEXT_HASH = ""
 LAST_CONTEXT_AT = 0.0
 
+
 def _hash_messages(msgs):
     raw = "|".join([f'{m.get("author","")}:{m.get("text","")}' for m in msgs])
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
 
 def push_clean_message(author: str, text: str, max_keep: int = 60):
     with STATE_LOCK:
@@ -386,9 +691,11 @@ def push_clean_message(author: str, text: str, max_keep: int = 60):
         if len(CLEAN_BUFFER) > max_keep:
             del CLEAN_BUFFER[:-max_keep]
 
+
 def build_consolidator_input(msgs):
     s = " | ".join([f'{m["author"]}: {m["text"]}' for m in msgs])
-    return f"MENSAGENS={s}"
+    return f"MESSAGES={s}"
+
 
 def call_ollama_sync(system_prompt: str, user_text: str, options: dict) -> str:
     payload = {
@@ -406,20 +713,18 @@ def call_ollama_sync(system_prompt: str, user_text: str, options: dict) -> str:
     out = ((data.get("message") or {}).get("content")) or ""
     return out.replace("\r", " ").replace("\n", " ").strip()
 
+
 def refresh_context_sync():
     global CONTEXT_TEXT, LAST_CONTEXT_HASH, LAST_CONTEXT_AT
     with STATE_LOCK:
         msgs = CLEAN_BUFFER[-20:]
         current_ctx = CONTEXT_TEXT
         current_hash = LAST_CONTEXT_HASH
-
     if not msgs:
         return ""
-
     h = _hash_messages(msgs)
     if h == current_hash and current_ctx:
         return current_ctx
-
     ctx = call_ollama_sync(
         SYSTEM_PROMPT_CONSOLIDATOR,
         build_consolidator_input(msgs),
@@ -431,6 +736,7 @@ def refresh_context_sync():
         LAST_CONTEXT_AT = time.time()
     return CONTEXT_TEXT
 
+
 def refresh_context_background():
     try:
         ctx = refresh_context_sync()
@@ -439,10 +745,11 @@ def refresh_context_background():
                 at = LAST_CONTEXT_AT
             log.info("[context] updated_at=%.0f ctx_preview=%r", at, ctx[:160])
     except Exception as e:
-        log.info("[context] erro ao gerar contexto: %s", e)
+        log.info("[context] failed: %s", e)
+
 
 # =========================
-# 🌊 STAGE 2: STREAM OLLAMA
+# 🌊 Stage 2 streaming (Ollama)
 # =========================
 def stream_ollama_chat(system_prompt: str, user_text: str, options: dict, sanitize_newlines: bool = True):
     payload = {
@@ -485,197 +792,198 @@ def stream_ollama_chat(system_prompt: str, user_text: str, options: dict, saniti
             if msg.get("done"):
                 return
 
-# =========================
-# 🧠 STAGE 1: PowerShell (REALTIME + capture)
-# =========================
-def _ps_quote(s: str) -> str:
-    return "'" + (s or "").replace("'", "''") + "'"
 
-def _effective_stage1_n_predict(req: AskRequest) -> str:
+# =========================
+# 🧠 Stage 1: llama.cpp /completion (stream + capture, delta-safe)
+# =========================
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _clean_stage1_text(raw: str) -> str:
+    s = raw or ""
+    s = _ANSI_RE.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if "```" in s:
+        s = s.split("```", 1)[0].strip()
+
+    cleaned_lines = []
+    for ln in s.split("\n"):
+        if _is_ignored_line(ln):
+            continue
+        cleaned_lines.append(ln.strip())
+    s = "\n".join([ln for ln in cleaned_lines if ln]).strip()
+
+    s = re.sub(r"[ \t]+", " ", s).strip()
+
+    if len(s) > STAGE1_DRAFT_MAX_CHARS:
+        s = s[:STAGE1_DRAFT_MAX_CHARS].rstrip() + "…"
+    if len(s) > MAX_DRAFT_CHARS:
+        s = s[:MAX_DRAFT_CHARS].rstrip() + "…"
+
+    return s
+
+
+def _effective_stage1_n_predict(req: AskRequest) -> int:
     base = req.n_predict if req.n_predict is not None else LLAMA_DEFAULT_NPREDICT
     try:
         base_i = int(base)
     except Exception:
         base_i = LLAMA_DEFAULT_NPREDICT
-    return str(min(max(base_i, 1), STAGE1_MAX_NPREDICT))
+    base_i = max(base_i, 1)
+    return min(base_i, STAGE1_MAX_NPREDICT)
 
-def _build_ps_cmd(req: AskRequest) -> list[str]:
-    url = (req.url or LLAMA_DEFAULT_URL).strip()
-    n_predict = _effective_stage1_n_predict(req)
-    temperature = str(req.temperature if req.temperature is not None else LLAMA_DEFAULT_TEMPERATURE)
-    top_p = str(req.top_p if req.top_p is not None else LLAMA_DEFAULT_TOPP)
 
-    # ✅ aqui é o pulo do gato: stage1 recebe AUTOR/FALA/INSTRUCAO
-    stage1_prompt = build_stage1_user_text(req.prompt)
+def _get_delta_from_obj(obj: dict) -> str:
+    if not obj or not isinstance(obj, dict):
+        return ""
+    for k in ("content", "response", "completion", "text"):
+        v = obj.get(k)
+        if isinstance(v, str) and v:
+            return v
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0] or {}
+        if isinstance(c0, dict):
+            delta = c0.get("delta") or {}
+            if isinstance(delta, dict):
+                v = delta.get("content")
+                if isinstance(v, str) and v:
+                    return v
+            v = c0.get("text")
+            if isinstance(v, str) and v:
+                return v
+            msg = c0.get("message") or {}
+            if isinstance(msg, dict):
+                v = msg.get("content")
+                if isinstance(v, str) and v:
+                    return v
+    return ""
 
-    # ✅ força UTF-8 no PowerShell (reduz “Ãª/Ã§”)
-    ps_prefix = " ".join(
-        [
-            "$ProgressPreference='SilentlyContinue';",
-            "$InformationPreference='Continue';",
-            "$OutputEncoding = New-Object System.Text.UTF8Encoding $false;",
-            "[Console]::OutputEncoding = $OutputEncoding;",
-        ]
-    )
 
-    # ✅ 6>&1 captura Write-Host (Information stream) + outros streams pro stdout
-    cmd = " ".join(
-        [
-            ps_prefix,
-            "&",
-            _ps_quote(str(SCRIPT_DEFAULT)),
-            "-Prompt",
-            _ps_quote(stage1_prompt),
-            "-NPredict",
-            n_predict,
-            "-Temperature",
-            temperature,
-            "-TopP",
-            top_p,
-            "-Url",
-            _ps_quote(url),
-            "-Stream",
-            "6>&1",
-        ]
-    )
-    return [
-        POWERSHELL,
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        cmd,
-    ]
+def _is_done_obj(obj: dict) -> bool:
+    if not obj or not isinstance(obj, dict):
+        return False
+    for k in ("done", "stop", "stopped", "isFinal", "final"):
+        v = obj.get(k)
+        if v is True:
+            return True
+        if isinstance(v, str) and v.strip().lower() in ("true", "1", "done", "stop"):
+            return True
+    return False
 
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_PS_PROMPT_RE = re.compile(r"^\s*PS\s+[A-Z]:\\.*?>\s*", re.IGNORECASE)
 
-def _clean_stage1_text(raw: str) -> str:
-    s = raw or ""
-    s = _ANSI_RE.sub("", s)
+def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[bytes], bytearray]:
+    url = (req.url or LLAMA_DEFAULT_URL).strip() or LLAMA_DEFAULT_URL
 
-    lines = []
-    for ln in s.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        if _PS_PROMPT_RE.match(ln):
-            continue
-        if ln.strip().startswith("[setup]"):
-            continue
-        lines.append(ln)
+    author, speech, stage1_user = build_stage1_user_text(req.prompt, mode=mode)
 
-    s = "\n".join(lines).strip()
+    # ✅ deterministic short reply for greeting/thanks/bye/how-are-you
+    canned = _stage1_canned(author, speech, mode=mode)
+    if canned:
+        b = canned.encode("utf-8", errors="ignore")
+        buf = bytearray(b)
 
-    if "```" in s:
-        s = s.split("```", 1)[0].strip()
+        def _gen_canned() -> Iterator[bytes]:
+            yield b
 
-    s = re.sub(r"[ \t]+", " ", s).strip()
+        return _gen_canned(), buf
 
-    # ✅ draft bem curto pro stage2
-    if len(s) > STAGE1_DRAFT_MAX_CHARS:
-        s = s[:STAGE1_DRAFT_MAX_CHARS].rstrip() + "…"
+    final_prompt = build_llama3_chat_prompt(STAGE1_SYSTEM, stage1_user)
 
-    if len(s) > MAX_DRAFT_CHARS:
-        s = s[:MAX_DRAFT_CHARS].rstrip() + "…"
-    return s
+    body = {
+        "prompt": final_prompt,
+        "stream": True,
+        "echo": False,
+        "n_predict": _effective_stage1_n_predict(req),
+        "temperature": float(req.temperature if req.temperature is not None else LLAMA_DEFAULT_TEMPERATURE),
+        "top_k": int(LLAMA_DEFAULT_TOPK),
+        "top_p": float(req.top_p if req.top_p is not None else LLAMA_DEFAULT_TOPP),
+        "typical_p": float(LLAMA_DEFAULT_TYPICALP),
+        "min_p": float(LLAMA_DEFAULT_MINP),
+        "repeat_last_n": int(LLAMA_DEFAULT_REPEAT_LAST_N),
+        "repeat_penalty": float(LLAMA_DEFAULT_REPEAT_PENALTY),
+        "presence_penalty": float(LLAMA_DEFAULT_PRESENCE_PENALTY),
+        "frequency_penalty": float(LLAMA_DEFAULT_FREQUENCY_PENALTY),
+        "stop": STAGE1_STOP,
+    }
 
-def stream_and_collect_llama_ps(req: AskRequest) -> Tuple[Iterator[bytes], bytearray]:
-    if not SCRIPT_DEFAULT.exists():
-        raise FileNotFoundError(f"Script não encontrado: {SCRIPT_DEFAULT}")
+    log.info("[stage1] url=%s mode=%s n_predict=%s temp=%.3f top_p=%.3f", url, mode, body["n_predict"], body["temperature"], body["top_p"])
 
-    cmd = _build_ps_cmd(req)
-    log.info("[stage1] script=%s exists=%s", str(SCRIPT_DEFAULT), SCRIPT_DEFAULT.exists())
-    log.info("[stage1] cmd=%r", cmd)
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=False,
-        bufsize=0,
-    )
     buf = bytearray()
 
     def _gen() -> Iterator[bytes]:
+        acc = ""
+        printed = 0
+        headers = {"Accept": "text/event-stream,application/json"}
         try:
-            if not proc.stdout:
-                return
-
-            if os.name == "nt":
-                import ctypes
-                import msvcrt
-
-                k32 = ctypes.windll.kernel32
-                handle = msvcrt.get_osfhandle(proc.stdout.fileno())
-                avail = ctypes.c_ulong(0)
-
-                while True:
-                    ok = k32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
-                    if not ok:
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.01)
+            with requests.post(
+                url,
+                json=body,
+                stream=True,
+                headers=headers,
+                timeout=(STAGE1_CONNECT_TIMEOUT, STAGE1_TIMEOUT),
+            ) as r:
+                r.raise_for_status()
+                for raw_line in r.iter_lines(decode_unicode=True):
+                    if not raw_line:
                         continue
-
-                    n = int(avail.value)
-                    if n > 0:
-                        chunk = os.read(proc.stdout.fileno(), min(n, 8192))
-                        if not chunk:
-                            if proc.poll() is not None:
-                                break
-                            time.sleep(0.005)
-                            continue
-
-                        buf.extend(chunk)
-                        yield chunk
-
-                        # ✅ corta o stream do stage1 se passar do limite
-                        if STAGE1_STREAM_MAX_BYTES > 0 and len(buf) >= STAGE1_STREAM_MAX_BYTES:
-                            try:
-                                proc.terminate()
-                            except Exception:
-                                pass
-                            break
-
+                    line = _maybe_strip_sse_prefix(raw_line)
+                    if not line:
                         continue
-
-                    if proc.poll() is not None:
+                    if line.strip() == "[DONE]":
                         break
-                    time.sleep(0.01)
-            else:
-                while True:
-                    chunk = proc.stdout.read(256)
-                    if not chunk:
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.01)
+
+                    obj = None
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        obj = None
+
+                    txt = ""
+                    done = False
+                    if isinstance(obj, dict):
+                        txt = _get_delta_from_obj(obj)
+                        done = _is_done_obj(obj)
+                    else:
+                        txt = str(line)
+
+                    if not txt and not done:
                         continue
-                    buf.extend(chunk)
-                    yield chunk
+
+                    # delta-safe: server might send full-so-far or true delta
+                    if txt:
+                        if len(txt) >= len(acc) and txt.startswith(acc):
+                            acc = txt
+                        else:
+                            acc += txt
+
+                    one = strip_prompt_echo(acc.replace("\r", "").replace("\n", " ").strip())
+                    cut = find_stop_index(one, STAGE1_STOP)
+                    if cut >= 0:
+                        one = one[:cut].strip()
+
+                    if len(one) > printed:
+                        out = one[printed:]
+                        b = out.encode("utf-8", errors="ignore")
+                        buf.extend(b)
+                        yield b
+                        printed = len(one)
+
                     if STAGE1_STREAM_MAX_BYTES > 0 and len(buf) >= STAGE1_STREAM_MAX_BYTES:
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
                         break
 
-        except GeneratorExit:
-            pass
-        finally:
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                    if cut >= 0 or done:
+                        break
+
+        except Exception as e:
+            msg = f"[stage1_http_error] {e}\n"
+            b = msg.encode("utf-8", errors="ignore")
+            buf.extend(b)
+            yield b
 
     return _gen(), buf
+
 
 # =========================
 # 🔎 Request JSON read + validate
@@ -683,27 +991,24 @@ def stream_and_collect_llama_ps(req: AskRequest) -> Tuple[Iterator[bytes], bytea
 async def _read_payload(request: Request) -> AskRequest:
     raw = await request.body()
     raw_text = raw.decode("utf-8", errors="replace")
-
     try:
         data = json.loads(raw_text) if raw_text.strip() else {}
     except Exception:
-        raise HTTPException(status_code=400, detail="Body não é JSON válido")
-
+        raise HTTPException(status_code=400, detail="Body is not valid JSON")
     if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="JSON precisa ser objeto (dict)")
-
+        raise HTTPException(status_code=400, detail="JSON must be an object")
     try:
         payload = AskRequest.model_validate(data)
     except ValidationError:
-        raise HTTPException(status_code=400, detail="Payload inválido (esperado: {prompt: string, ...})")
+        raise HTTPException(status_code=400, detail="Invalid payload (expected: {prompt: string, ...})")
 
     prompt = (payload.prompt or "").strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="Campo 'prompt' ausente/vazio")
-
+        raise HTTPException(status_code=400, detail="Missing/empty 'prompt'")
     if len(prompt) > MAX_PROMPT_CHARS:
         payload.prompt = prompt[:MAX_PROMPT_CHARS]
     return payload
+
 
 # =========================
 # 🌐 HTML
@@ -711,14 +1016,16 @@ async def _read_payload(request: Request) -> AskRequest:
 @app.get("/")
 def serve_root():
     if not INDEX_PATH.exists():
-        return JSONResponse({"error": "index.html não encontrado"}, status_code=404)
+        return JSONResponse({"error": "index.html not found"}, status_code=404)
     return FileResponse(str(INDEX_PATH), media_type="text/html")
+
 
 @app.get("/index.html")
 def serve_index():
     if not INDEX_PATH.exists():
-        return JSONResponse({"error": "index.html não encontrado"}, status_code=404)
+        return JSONResponse({"error": "index.html not found"}, status_code=404)
     return FileResponse(str(INDEX_PATH), media_type="text/html")
+
 
 # =========================
 # ✅ HEALTH
@@ -728,19 +1035,16 @@ def health():
     return {
         "ok": True,
         "stage1": {
-            "script": str(SCRIPT_DEFAULT),
-            "script_exists": SCRIPT_DEFAULT.exists(),
             "default_url": LLAMA_DEFAULT_URL,
             "stream_stage1_default": STREAM_STAGE1_DEFAULT,
             "stage1_max_n_predict": STAGE1_MAX_NPREDICT,
             "stage1_stream_max_bytes": STAGE1_STREAM_MAX_BYTES,
             "stage1_draft_max_chars": STAGE1_DRAFT_MAX_CHARS,
+            "timeouts": {"connect_s": STAGE1_CONNECT_TIMEOUT, "total_s": STAGE1_TIMEOUT},
         },
-        "stage2": {
-            "ollama_url": OLLAMA_URL,
-            "model": MODEL,
-        },
+        "stage2": {"ollama_url": OLLAMA_URL, "model": MODEL},
     }
+
 
 # =========================
 # ✅ STAGE 1 ONLY
@@ -749,12 +1053,12 @@ def health():
 async def ask_llama(req: Request):
     payload = await _read_payload(req)
     try:
-        gen, _buf = stream_and_collect_llama_ps(payload)
+        mode = resolve_mode(payload.route or "", "positivo")
+        gen, _buf = stream_and_collect_llama_api(payload, mode=mode)
         return StreamingResponse(gen, media_type="text/plain; charset=utf-8", headers=STREAM_HEADERS)
-    except FileNotFoundError as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
     except Exception as e:
-        return JSONResponse({"error": f"Erro ao chamar PowerShell: {e}"}, status_code=500)
+        return JSONResponse({"error": f"Stage1 HTTP call failed: {e}"}, status_code=500)
+
 
 # =========================
 # ✅ STAGE 2 ONLY (corrector)
@@ -766,6 +1070,7 @@ def _read_prompt_json(body: dict) -> str:
     if len(prompt) > MAX_PROMPT_CHARS:
         prompt = prompt[:MAX_PROMPT_CHARS]
     return prompt
+
 
 @app.post("/ask")
 async def ask(req: Request):
@@ -786,25 +1091,27 @@ async def ask(req: Request):
         headers=STREAM_HEADERS,
     )
 
+
 # =========================
 # ✅ CHAIN CORE
 # =========================
 def _read_route(body: dict) -> str:
     return str((body or {}).get("route", "")).strip().lower()
 
+
 def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: str) -> Iterator[bytes]:
     last = extract_last_valid(payload.prompt)
     if last:
         push_clean_message(last["author"], last["text"])
-        background_tasks.add_task(refresh_context_background)
+    background_tasks.add_task(refresh_context_background)
 
     with STATE_LOCK:
         ctx_now = CONTEXT_TEXT
 
-    # ---- Stage 1 (ask-llama.ps1): realtime stream + capture
+    # ---- Stage 1: stream + capture (HTTP)
+    draft = ""
     try:
-        gen1, buf = stream_and_collect_llama_ps(payload)
-
+        gen1, buf = stream_and_collect_llama_api(payload, mode=mode)
         if payload.stream_stage1:
             yield b"[stage1]\n"
             for ch in gen1:
@@ -825,7 +1132,7 @@ def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: s
             yield _to_str(e).encode("utf-8", errors="ignore")
             yield b"\n"
 
-    # ---- Stage 2: stream 120b (só começa depois do stage1 terminar)
+    # ---- Stage 2: stream 120b (starts only after stage1 finishes)
     if mode == "negativo":
         sys_prompt = SYSTEM_PROMPT_PROFILE_NEGATIVE
         options = OPTIONS_PROFILE_NEGATIVE
@@ -833,7 +1140,7 @@ def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: s
         sys_prompt = SYSTEM_PROMPT_PROFILE_POSITIVE
         options = OPTIONS_PROFILE_POSITIVE
 
-    user_text = build_profile_user_text(payload.prompt, draft=draft, context=ctx_now)
+    user_text = build_profile_user_text(payload.prompt, draft=draft, context=ctx_now, mode=mode)
 
     log.info(
         "[chain] mode=%s prompt_len=%d draft_len=%d ctx_len=%d stream_stage1=%s",
@@ -850,20 +1157,19 @@ def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: s
     for chunk in stream_ollama_chat(sys_prompt, user_text, options, sanitize_newlines=False):
         yield _to_str(chunk).encode("utf-8", errors="ignore")
 
+
 # =========================
 # ✅ CHAIN ENDPOINTS
 # =========================
 async def _ask_me_core(req: Request, background_tasks: BackgroundTasks, mode: str):
     payload = await _read_payload(req)
-
     try:
         body = await req.json()
     except Exception:
         body = {}
 
     route = _read_route(body)
-    if route in ("negativo", "negative", "no", "hard", "reject"):
-        mode = "negativo"
+    mode = resolve_mode(route, mode)
 
     return StreamingResponse(
         chain_stream(payload, background_tasks, mode=mode),
@@ -871,16 +1177,19 @@ async def _ask_me_core(req: Request, background_tasks: BackgroundTasks, mode: st
         headers=STREAM_HEADERS,
     )
 
+
 @app.post("/ask_me")
 async def ask_me(req: Request, background_tasks: BackgroundTasks):
     return await _ask_me_core(req, background_tasks, mode="positivo")
+
 
 @app.post("/ask_me_neg")
 async def ask_me_neg(req: Request, background_tasks: BackgroundTasks):
     return await _ask_me_core(req, background_tasks, mode="negativo")
 
+
 # =========================
-# 🧾 Context endpoints (as before)
+# 🧾 Context endpoints
 # =========================
 @app.post("/context_ingest")
 async def context_ingest(req: Request, background_tasks: BackgroundTasks):
@@ -913,6 +1222,7 @@ async def context_ingest(req: Request, background_tasks: BackgroundTasks):
         "context_updated_at": at,
     }
 
+
 @app.get("/context")
 def get_context():
     with STATE_LOCK:
@@ -922,6 +1232,7 @@ def get_context():
             "buffer_size": len(CLEAN_BUFFER),
             "last_items": CLEAN_BUFFER[-3:],
         }
+
 
 @app.post("/context_refresh")
 def context_refresh():
@@ -933,10 +1244,12 @@ def context_refresh():
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
+
 @app.get("/buffer")
 def get_buffer():
     with STATE_LOCK:
         return {"buffer_size": len(CLEAN_BUFFER), "items": CLEAN_BUFFER[-30:]}
+
 
 # =========================
 # ▶️ RUN

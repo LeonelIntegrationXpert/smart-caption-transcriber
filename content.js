@@ -210,6 +210,12 @@ let lastAppendAtByKey = new Map(); // origin::speaker -> ts (p/ merge pipoco)
 // =====================================================
 // Utils
 // =====================================================
+function stripGuestSuffix(name) {
+  return String(name || "")
+    .replace(/\s*\((?:convidado|guest)\)\s*$/iu, "")
+    .trim();
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -1664,7 +1670,7 @@ function displayLineAuthorAndText(line) {
 
   const p = parseTranscriptLine(raw);
   if (p && p.speaker && p.text) {
-    let sp = String(p.speaker || "").trim();
+    let sp = stripGuestSuffix(String(p.speaker || "").trim());
     if (isUnknownSpeaker(sp)) sp = UNKNOWN_SPEAKER_LABEL;
 
     let tx = String(p.text || "").trim();
@@ -1697,7 +1703,7 @@ function splitTeamsInlineTurns(raw) {
   const out = [];
   let m;
   while ((m = re.exec(s)) !== null) {
-    const sp = normalizeSpacesOneLine(m[1]);
+    const sp = stripGuestSuffix(normalizeSpacesOneLine(m[1]));
     const msg = normalizeSpacesOneLine(m[2]);
     if (!sp || !msg) continue;
     out.push({ speaker: sp, text: msg });
@@ -1804,7 +1810,7 @@ function stopTeamsRttTimerIfIdle() {
 function noteTeamsRtt(speaker, text) {
   const origin = "Teams";
 
-  speaker = normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL);
+  speaker = stripGuestSuffix(normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL));
   speaker = guessSpeakerIfUnknown(speaker);
 
   if (!CAPTURE_SELF_LINES && isMe(speaker)) return;
@@ -3513,7 +3519,7 @@ function splitSpeakerInline(text) {
   if (!s) return null;
   const m = s.match(/^(.{2,40}?)[：:]\s*(.{1,})$/u);
   if (m) {
-    const speaker = m[1].trim();
+    const speaker = stripGuestSuffix(m[1].trim());
     const msg = m[2].trim();
     if (speaker && msg) return { speaker, text: msg };
   }
@@ -3589,7 +3595,7 @@ function tryMergeTeamsDeltaIntoLastLine(origin, speaker, deltaText) {
 // Append (linha nova)
 // =====================================================
 function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
-  speaker = normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL);
+  speaker = stripGuestSuffix(normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL));
   origin = normalizeSpacesOneLine(origin || "Unknown");
   const originLower = origin.toLowerCase();
 
