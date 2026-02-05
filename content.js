@@ -1,4 +1,4 @@
-/* transcriber.content.js — MT Transcriber (with merge + optional correction toggle)
+/* transcriber.content.js — MT Transcriber (with merge + optional correction toggle + resizers)
    - Captura legendas (Meet / Teams / Slack)
    - Mostra histórico + sugestões em painel lateral in-page
    - ✅ Auto-IA: depois de 1s sem novas linhas, manda o “tail” do chat pra IA
@@ -19,9 +19,10 @@
    - ✅ FIX NOVO: Bloco consolidado não “acumula” repetição (dedupe extra no merge delta / display)
    - ✅ FIX NOVO: Bloco consolidado mostra SOMENTE o ÚLTIMO bloco (merge só de “pipoco”)
    - ✅ NEW: Export da conversa (TXT / Alt+Clique JSON), Limpar histórico, e ✕ por item do histórico de sugestões
+   - ✅ NEW (layout): splitters arrastáveis (largura do painel + divisória Transcrição/Respostas) + persistência + dblclick reset
 */
-
 "use strict";
+
 console.log("✅ Transcriber content script carregado!");
 
 // =====================================================
@@ -36,9 +37,7 @@ function parseRewriteResponse(res) {
   if (!res || typeof res !== "object") return null;
   const text = String(res.text || "").trim();
   const lines = Array.isArray(res.lines)
-    ? res.lines
-        .map((s) => String(s || "").trim())
-        .filter(Boolean)
+    ? res.lines.map((s) => String(s || "").trim()).filter(Boolean)
     : null;
 
   let outLines = lines;
@@ -93,7 +92,8 @@ function requestRewriteContextWithRetries(lines, cb) {
 
         if (attempt + 1 < maxAttempts) {
           const delay = Math.round(
-            REWRITE_RETRY_BASE_DELAY_MS * Math.pow(REWRITE_RETRY_BACKOFF, attempt) +
+            REWRITE_RETRY_BASE_DELAY_MS *
+              Math.pow(REWRITE_RETRY_BACKOFF, attempt) +
               Math.random() * REWRITE_RETRY_JITTER_MS
           );
           return setTimeout(() => sendAttempt(attempt + 1), delay);
@@ -159,12 +159,18 @@ const UI_IDS = {
   style: "__mt_style",
   overlay: "__mt_dim_overlay",
   bubble: "__mt_launcher_bubble",
+
   panel: "__mt_side_panel",
   panelHeader: "__mt_side_panel_header",
   panelClose: "__mt_side_panel_close",
   panelOpenTab: "__mt_side_panel_open_tab",
   panelStatus: "__mt_side_panel_status",
+
   panelTranscript: "__mt_side_panel_transcript",
+
+  // ✅ splitters
+  panelResizeW: "__mt_panel_resize_w",
+  panelResizeH: "__mt_panel_resize_h",
 
   // suggestions (2 rotas)
   panelSuggestionsWrap: "__mt_side_panel_suggestions_wrap",
@@ -249,6 +255,7 @@ function __mt_sanitizeAiLine(rawLine) {
   // tenta preservar estrutura "Origin: Speaker: Text"
   const probe = raw.startsWith("🎤") ? raw : `🎤 ${raw}`;
   const p = parseTranscriptLine(probe);
+
   if (p && p.origin && p.speaker) {
     const safeText = __mt_escapeColonInBody(p.text || "");
     return `${String(p.origin).trim()}: ${String(p.speaker).trim()}: ${safeText}`.trim();
@@ -434,7 +441,6 @@ function collapseTeamsRepeats(text) {
       if (words.length % rep !== 0) continue;
       const patLen = words.length / rep;
       if (patLen < 6) continue;
-
       const pat = words.slice(0, patLen).join(" ");
       let ok = true;
       for (let r = 1; r < rep; r++) {
@@ -451,6 +457,7 @@ function collapseTeamsRepeats(text) {
   // 2) por sentenças
   const segsRaw = s.match(/[^.!?…]+[.!?…]*/g) || [];
   const segs = segsRaw.map((x) => normalizeSpacesOneLine(x)).filter(Boolean);
+
   if (segs.length >= 2) {
     const canon = (x) =>
       normTextKey(String(x || "").replace(/[.!?…,"'“”‘’]/g, " "));
@@ -512,6 +519,7 @@ function isUnknownSpeaker(s) {
 }
 
 const UNKNOWN_SPEAKER_LABEL = "Desconhecido";
+
 const SINGLE_SPEAKER_GUESS_UNKNOWN = true;
 const SINGLE_SPEAKER_GUESS_WINDOW_MS = 120000;
 
@@ -520,6 +528,7 @@ let recentNonUnknownSpeakers = new Map(); // norm -> { name, ts }
 function noteNonUnknownSpeaker(name) {
   const n = normName(name);
   if (!n) return;
+
   const now = Date.now();
   recentNonUnknownSpeakers.set(n, { name: String(name || "").trim(), ts: now });
 
@@ -609,6 +618,7 @@ let captureIntervalId = null;
 let flushIntervalId = null;
 let startTimeoutId = null;
 let flushDebounceId = null;
+
 let extensionInvalidated = false;
 
 let IS_TOP_FRAME = false;
@@ -672,10 +682,8 @@ function tryAcquireReplyLock(payloadStr) {
 
   lastReplyKey = key;
   lastReplyAt = now;
-
   repliesInFlight = true;
   repliesLockUntil = now + REPLY_LOCK_MS;
-
   return { ok: true, key };
 }
 
@@ -718,6 +726,230 @@ function toggleCorrection() {
 }
 
 // =====================================================
+// ✅ Panel resizers (width + split height) — drag handles
+// - Arrasta a borda esquerda do painel pra largura
+// - Arrasta a divisória horizontal pra altura do bloco de Transcrição
+// - Persistência em localStorage
+// - Duplo clique = reset
+// =====================================================
+const __MT_PANEL_W_KEY = "__mt_panel_w_px_v1";
+const __MT_PANEL_TOP_H_KEY = "__mt_panel_top_h_px_v1";
+
+const __MT_PANEL_MIN_W_PX = 360;
+const __MT_PANEL_MAX_W_VW = 0.95; // até 95% da tela (ocupa quase tudo)
+const __MT_PANEL_DEFAULT_W_MAX_PX = 520;
+const __MT_PANEL_DEFAULT_W_VW = 0.28;
+
+const __MT_PANEL_MIN_TOP_H_PX = 140;
+const __MT_PANEL_MIN_BOTTOM_H_PX = 220;
+const __MT_PANEL_RESIZER_H_PX = 8;
+
+let __mt_panelWpx = null; // number|null
+let __mt_panelTopHpx = null; // number|null
+
+function __mt_clamp(n, a, b) {
+  n = Number(n);
+  if (!Number.isFinite(n)) return a;
+  return Math.max(a, Math.min(b, n));
+}
+
+function __mt_defaultPanelWidthPx() {
+  try {
+    return Math.min(
+      __MT_PANEL_DEFAULT_W_MAX_PX,
+      Math.round(window.innerWidth * __MT_PANEL_DEFAULT_W_VW)
+    );
+  } catch {
+    return __MT_PANEL_DEFAULT_W_MAX_PX;
+  }
+}
+
+function __mt_defaultPanelTopHeightPx() {
+  try {
+    return Math.round(window.innerHeight * 0.45); // ~45vh
+  } catch {
+    return 320;
+  }
+}
+
+function __mt_loadPanelSizing() {
+  try {
+    const w = Number(localStorage.getItem(__MT_PANEL_W_KEY) || "");
+    const h = Number(localStorage.getItem(__MT_PANEL_TOP_H_KEY) || "");
+    __mt_panelWpx = Number.isFinite(w) && w > 0 ? w : null;
+    __mt_panelTopHpx = Number.isFinite(h) && h > 0 ? h : null;
+  } catch {
+    __mt_panelWpx = null;
+    __mt_panelTopHpx = null;
+  }
+}
+
+function __mt_savePanelSizingSoon() {
+  // salva leve (sem flood)
+  try {
+    if (__mt_savePanelSizingSoon._t) clearTimeout(__mt_savePanelSizingSoon._t);
+    __mt_savePanelSizingSoon._t = setTimeout(() => {
+      __mt_savePanelSizingSoon._t = null;
+      try {
+        if (Number.isFinite(__mt_panelWpx) && __mt_panelWpx > 0)
+          localStorage.setItem(__MT_PANEL_W_KEY, String(__mt_panelWpx | 0));
+        if (Number.isFinite(__mt_panelTopHpx) && __mt_panelTopHpx > 0)
+          localStorage.setItem(__MT_PANEL_TOP_H_KEY, String(__mt_panelTopHpx | 0));
+      } catch {}
+    }, 120);
+  } catch {}
+}
+
+function __mt_applyPanelSizing(opts = {}) {
+  const clampToViewport = !!opts.clampToViewport;
+  const maxW = Math.round((window.innerWidth || 1200) * __MT_PANEL_MAX_W_VW);
+
+  if (!Number.isFinite(__mt_panelWpx) || __mt_panelWpx <= 0)
+    __mt_panelWpx = __mt_defaultPanelWidthPx();
+
+  __mt_panelWpx = __mt_clamp(__mt_panelWpx, __MT_PANEL_MIN_W_PX, Math.max(__MT_PANEL_MIN_W_PX, maxW));
+
+  if (!Number.isFinite(__mt_panelTopHpx) || __mt_panelTopHpx <= 0)
+    __mt_panelTopHpx = __mt_defaultPanelTopHeightPx();
+
+  // Se o viewport encolher, garante que ainda sobra espaço pro bottom
+  if (clampToViewport) {
+    const maxTop = Math.max(
+      __MT_PANEL_MIN_TOP_H_PX,
+      (window.innerHeight || 800) - __MT_PANEL_MIN_BOTTOM_H_PX - 140
+    );
+    __mt_panelTopHpx = __mt_clamp(__mt_panelTopHpx, __MT_PANEL_MIN_TOP_H_PX, maxTop);
+  }
+
+  try {
+    document.documentElement.style.setProperty("--mt_panel_w", `${__mt_panelWpx}px`);
+    document.documentElement.style.setProperty("--mt_panel_top_h", `${__mt_panelTopHpx}px`);
+  } catch {}
+}
+
+function __mt_resetPanelSizing() {
+  try {
+    localStorage.removeItem(__MT_PANEL_W_KEY);
+    localStorage.removeItem(__MT_PANEL_TOP_H_KEY);
+  } catch {}
+
+  __mt_panelWpx = __mt_defaultPanelWidthPx();
+  __mt_panelTopHpx = __mt_defaultPanelTopHeightPx();
+  __mt_applyPanelSizing({ clampToViewport: true });
+  setPanelStatus("Layout resetado ✅");
+}
+
+function __mt_installPanelResizers(panelEl) {
+  if (!panelEl) return;
+
+  const wHandle = panelEl.querySelector(`#${UI_IDS.panelResizeW}`);
+  const hHandle = panelEl.querySelector(`#${UI_IDS.panelResizeH}`);
+  const transcriptEl = panelEl.querySelector(`#${UI_IDS.panelTranscript}`);
+
+  // aplica sizing (se ainda não aplicou)
+  __mt_applyPanelSizing({ clampToViewport: true });
+
+  // ---------- WIDTH (ew-resize) ----------
+  if (wHandle) {
+    wHandle.addEventListener("dblclick", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      __mt_resetPanelSizing();
+    });
+
+    wHandle.addEventListener(
+      "pointerdown",
+      (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try {
+          wHandle.setPointerCapture(ev.pointerId);
+        } catch {}
+
+        const onMove = (e) => {
+          // painel ancorado à direita: largura = windowWidth - mouseX
+          const maxW = Math.round((window.innerWidth || 1200) * __MT_PANEL_MAX_W_VW);
+          const w = (window.innerWidth || 1200) - Number(e.clientX || 0);
+          __mt_panelWpx = __mt_clamp(w, __MT_PANEL_MIN_W_PX, Math.max(__MT_PANEL_MIN_W_PX, maxW));
+          __mt_applyPanelSizing({ clampToViewport: true });
+          __mt_savePanelSizingSoon();
+        };
+
+        const onUp = () => {
+          try {
+            wHandle.releasePointerCapture(ev.pointerId);
+          } catch {}
+          window.removeEventListener("pointermove", onMove, true);
+          window.removeEventListener("pointerup", onUp, true);
+          __mt_savePanelSizingSoon();
+          setPanelStatus("Largura ajustada ✅");
+        };
+
+        window.addEventListener("pointermove", onMove, true);
+        window.addEventListener("pointerup", onUp, true);
+      },
+      { passive: false }
+    );
+  }
+
+  // ---------- SPLIT HEIGHT (ns-resize) ----------
+  if (hHandle && transcriptEl) {
+    hHandle.addEventListener("dblclick", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      __mt_resetPanelSizing();
+    });
+
+    hHandle.addEventListener(
+      "pointerdown",
+      (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        try {
+          hHandle.setPointerCapture(ev.pointerId);
+        } catch {}
+
+        const onMove = (e) => {
+          const panelRect = panelEl.getBoundingClientRect();
+          const transRect = transcriptEl.getBoundingClientRect();
+
+          // espaço total (top do transcript até bottom do painel)
+          const available = Math.max(200, panelRect.bottom - transRect.top);
+          const maxTop = Math.max(
+            __MT_PANEL_MIN_TOP_H_PX,
+            available - __MT_PANEL_MIN_BOTTOM_H_PX - __MT_PANEL_RESIZER_H_PX
+          );
+
+          const want = Number(e.clientY || 0) - transRect.top;
+          __mt_panelTopHpx = __mt_clamp(want, __MT_PANEL_MIN_TOP_H_PX, maxTop);
+          __mt_applyPanelSizing({ clampToViewport: true });
+          __mt_savePanelSizingSoon();
+        };
+
+        const onUp = () => {
+          try {
+            hHandle.releasePointerCapture(ev.pointerId);
+          } catch {}
+          window.removeEventListener("pointermove", onMove, true);
+          window.removeEventListener("pointerup", onUp, true);
+          __mt_savePanelSizingSoon();
+          setPanelStatus("Divisória ajustada ✅");
+        };
+
+        window.addEventListener("pointermove", onMove, true);
+        window.addEventListener("pointerup", onUp, true);
+      },
+      { passive: false }
+    );
+  }
+}
+
+// clamp quando muda o tamanho da janela
+try {
+  window.addEventListener("resize", () => __mt_applyPanelSizing({ clampToViewport: true }));
+} catch {}
+
+// =====================================================
 // Messaging (safe)
 // =====================================================
 function stopTranscriber(reason) {
@@ -725,6 +957,7 @@ function stopTranscriber(reason) {
   if (flushIntervalId) clearInterval(flushIntervalId);
   if (startTimeoutId) clearTimeout(startTimeoutId);
   if (flushDebounceId) clearTimeout(flushDebounceId);
+
   cancelAutoIaTimer();
 
   if (teamsRttTimerId) {
@@ -788,6 +1021,7 @@ function setPanelStatus(msg) {
 function copyToClipboard(text) {
   const t = String(text || "").trim();
   if (!t) return;
+
   try {
     navigator.clipboard?.writeText(t);
     setPanelStatus("Copiado ✅");
@@ -842,15 +1076,12 @@ function __mt_buildExportPlainText() {
   lines.push(`exportedAt: ${nowIso()}`);
   lines.push(`url: ${String(location.href || "")}`);
   lines.push("");
-
   lines.push("=== TRANSCRIPT (fullHistory) ===");
   lines.push(String(transcriptData || "").trim() || "(vazio)");
   lines.push("");
-
   lines.push("=== PANEL TAIL (panelTranscriptCache) ===");
   lines.push(String(panelTranscriptCache || "").trim() || "(vazio)");
   lines.push("");
-
   lines.push("=== FIXED BLOCK (panelFixedBlockCache) ===");
   lines.push(String(panelFixedBlockCache || "").trim() || "(vazio)");
   lines.push("");
@@ -867,7 +1098,9 @@ function __mt_buildExportPlainText() {
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       lines.push(
-        `--- #${i + 1} id=${it.id} ts=${new Date(it.ts || Date.now()).toISOString()} done=${it.done !== false}`
+        `--- #${i + 1} id=${it.id} ts=${new Date(it.ts || Date.now()).toISOString()} done=${
+          it.done !== false
+        }`
       );
       lines.push(String(it.text || "").trim());
       lines.push("");
@@ -907,7 +1140,11 @@ function exportConversation(ev) {
       },
       version: "mt_export_v1",
     };
-    __mt_download(`${base}.json`, JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+    __mt_download(
+      `${base}.json`,
+      JSON.stringify(payload, null, 2),
+      "application/json;charset=utf-8"
+    );
   }
 
   setPanelStatus(okTxt ? "Exportado ✅" : "Falha ao exportar ❌");
@@ -971,7 +1208,7 @@ function clearAllHistory(askConfirm = true) {
     fixedLineFlags.clear();
   } catch {}
 
-  // storage (não mexe em __mt_auto_ia / __mt_correction / __mt_dim_enabled)
+  // storage (não mexe em __mt_auto_ia / __mt_correction / __mt_dim_enabled / sizing)
   try {
     localStorage.removeItem(SUG_HISTORY_STORE_KEY);
   } catch {}
@@ -990,7 +1227,10 @@ function clearAllHistory(askConfirm = true) {
   // ✅ limpa também no background (pra refresh não “voltar”)
   try {
     safeSendMessage(
-      { action: "transcriptData", payload: { fullHistory: "", latestLine: "", filename: "" } },
+      {
+        action: "transcriptData",
+        payload: { fullHistory: "", latestLine: "", filename: "" },
+      },
       () => {}
     );
   } catch {}
@@ -1003,6 +1243,7 @@ const SUG_HISTORY_STORE_KEY = "__mt_sug_history_v1";
 const SUG_HISTORY_MAX = 10;
 
 let __sugSeq = 0;
+
 const sugState = {
   positivo: { items: [], openId: null, liveId: null },
   negativo: { items: [], openId: null, liveId: null },
@@ -1035,6 +1276,7 @@ function sugHost(slot) {
 }
 
 let __sugSaveTimer = null;
+
 function saveSugHistorySoon() {
   try {
     if (__sugSaveTimer) clearTimeout(__sugSaveTimer);
@@ -1072,10 +1314,8 @@ function loadSugHistory() {
 
     sugState.positivo.items = normArr(obj.positivo);
     sugState.negativo.items = normArr(obj.negativo);
-
     sugState.positivo.liveId = null;
     sugState.negativo.liveId = null;
-
     sugState.positivo.openId = sugState.positivo.items[0]?.id || null;
     sugState.negativo.openId = sugState.negativo.items[0]?.id || null;
   } catch {}
@@ -1103,11 +1343,9 @@ function sugOpenOnly(slot, id) {
   slot = sugSlotNorm(slot);
   const host = sugHost(slot);
   if (!host) return;
-
   host.querySelectorAll("details.mt-hist-item").forEach((d) => {
     if (d.dataset?.id !== id) d.open = false;
   });
-
   sugState[slot].openId = id || null;
   saveSugHistorySoon();
 }
@@ -1124,12 +1362,9 @@ function sugDelete(slot, id) {
   slot = sugSlotNorm(slot);
   const st = sugState[slot];
   const before = (st.items || []).length;
-
   st.items = (st.items || []).filter((x) => x && x.id !== id);
-
   if (st.openId === id) st.openId = st.items[0]?.id || null;
   if (st.liveId === id) st.liveId = null;
-
   if ((st.items || []).length !== before) {
     saveSugHistorySoon();
     sugRender(slot);
@@ -1141,7 +1376,6 @@ function sugRender(slot) {
   slot = sugSlotNorm(slot);
   const host = sugHost(slot);
   if (!host) return;
-
   const st = sugState[slot];
   sugEnsureOpenId(slot);
 
@@ -1167,7 +1401,6 @@ function sugRender(slot) {
       const details = document.createElement("details");
       details.className = "mt-hist-item";
       details.dataset.id = it.id;
-
       details.open = st.openId ? st.openId === it.id : idx === 0;
 
       const summary = document.createElement("summary");
@@ -1267,7 +1500,6 @@ function sugStartLive(slot) {
 
   st.items = [it].concat((st.items || []).filter((x) => x && x.id !== id));
   st.liveId = id;
-
   if (!st.openId) st.openId = id;
 
   sugPrune(slot);
@@ -1279,12 +1511,15 @@ function sugStartLive(slot) {
 function sugUpdateLive(slot, text) {
   slot = sugSlotNorm(slot);
   const st = sugState[slot];
+
   const t = tail(String(text || ""), 12000);
   if (!st.liveId) sugStartLive(slot);
   const it = (st.items || []).find((x) => x.id === st.liveId);
   if (!it) return;
+
   it.text = t;
   it.done = false;
+
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
@@ -1303,6 +1538,7 @@ function sugFinalizeLive(slot) {
   }
 
   st.liveId = null;
+
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
@@ -1341,12 +1577,14 @@ function sugAddFinal(slot, text) {
   st.items = [it].concat((st.items || []).slice(0, SUG_HISTORY_MAX - 1));
   st.openId = it.id;
   st.liveId = null;
+
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
 }
 
 function setAllSuggestionSlots(_) {}
+
 function setSuggestionSlot(slot, raw) {
   slot = sugSlotNorm(slot);
   sugUpdateLive(slot, raw);
@@ -1356,8 +1594,8 @@ function setSuggestionSlot(slot, raw) {
 // ✅ FIX: evita duplicar histórico quando background manda callback+stream juntos
 // =====================================================
 let __mt_ignoreStreamUntil = 0;
-
 const STREAM_SUPPRESS_AFTER_FINAL_MS = 4500;
+
 const __mt_lastFinal = {
   positivo: { ts: 0, hash: "" },
   negativo: { ts: 0, hash: "" },
@@ -1399,6 +1637,7 @@ function __mt_sugSetFinal(slot, text) {
   } else {
     sugAddFinal(slot, t);
   }
+
   __mt_noteFinal(slot, t);
 }
 
@@ -1419,6 +1658,7 @@ function displayLineAuthorAndText(line) {
     if (String(p.origin || "").trim().toLowerCase() === "teams") {
       tx = collapseTeamsRepeats(tx);
     }
+
     return `${sp}: ${tx}`;
   }
 
@@ -1427,7 +1667,6 @@ function displayLineAuthorAndText(line) {
   if (m) {
     let sp = String(m[1] || "").trim();
     if (isUnknownSpeaker(sp)) sp = UNKNOWN_SPEAKER_LABEL;
-
     let tx = String(m[2] || "").trim();
     return `${sp}: ${tx}`;
   }
@@ -1458,7 +1697,6 @@ function formatBlockForPanel(raw) {
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
-
   if (!lines.length) return "";
 
   const out = [];
@@ -1570,8 +1808,8 @@ function noteTeamsRtt(speaker, text) {
 
   const k = teamsRttKey(origin, speaker);
   const now = Date.now();
-  const cur = teamsRttBuf.get(k);
 
+  const cur = teamsRttBuf.get(k);
   if (cur && cur.text === trimmed) {
     cur.lastUpdateAt = now;
     teamsRttBuf.set(k, cur);
@@ -1589,9 +1827,9 @@ function commitTeamsRttIfReady() {
   for (const [k, st] of teamsRttBuf.entries()) {
     const origin = "Teams";
     const speaker = k.split("::").slice(1).join("::") || UNKNOWN_SPEAKER_LABEL;
-
     const text = String(st?.text || "").trim();
     const lastAt = Number(st?.lastUpdateAt || 0);
+
     if (!text) {
       teamsRttBuf.delete(k);
       continue;
@@ -1601,7 +1839,6 @@ function commitTeamsRttIfReady() {
     const finalNow = hasFinalPunct(text);
 
     if (!finalNow && idleFor < TEAMS_RTT_IDLE_COMMIT_MS) continue;
-
     if (!finalNow && text.length < TEAMS_RTT_MIN_CHARS) {
       teamsRttBuf.delete(k);
       continue;
@@ -1626,6 +1863,7 @@ function commitTeamsRttIfReady() {
 // =====================================================
 let autoIaEnabled = AUTO_IA_ENABLED_DEFAULT;
 let autoIaTimerId = null;
+
 let lastTranscriptActivityAt = 0;
 let lastAutoIaSourceHash = "";
 let autoIaPauseUntil = 0;
@@ -1654,7 +1892,6 @@ function getTailLinesForAutoIa(maxLines = AUTO_IA_MAX_LINES) {
     .map((s) => s.trim())
     .filter(Boolean)
     .filter((l) => !isInternalInjectedLine(l));
-
   if (!lines.length) return [];
   return lines.slice(-Math.max(1, maxLines));
 }
@@ -1687,7 +1924,6 @@ function mergePipocadas(lines) {
 
     if (last && last.origin === origin && last.speaker === speaker) {
       const prevText = last.text || "";
-
       if (isTinyToken(prevText) && isTinyToken(t)) {
         last.text = prevText + t;
         continue;
@@ -1721,12 +1957,13 @@ function mergeRunsBySpeaker(lines) {
   let cur = null;
 
   for (const raw of lines || []) {
-    const probe = String(raw || "").trim().startsWith("🎤") ? String(raw).trim() : `🎤 ${String(raw || "").trim()}`;
+    const probe = String(raw || "").trim().startsWith("🎤")
+      ? String(raw).trim()
+      : `🎤 ${String(raw || "").trim()}`;
     const p = parseTranscriptLine(probe);
 
     const origin = String(p.origin || "").trim() || "Teams";
     const speaker = String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL;
-
     let text = normalizeSpacesOneLine(p.text || "");
     if (!text) continue;
 
@@ -1822,7 +2059,6 @@ function flushNow(reason) {
         }
       }
     );
-
     lastSavedHash = currentHash;
     latestBySpeaker.clear();
   } catch (err) {
@@ -1870,8 +2106,8 @@ function renderTranscriptListFromCache() {
 
       const txt = document.createElement("div");
       txt.className = "mt-line-text";
-      const display = displayLineAuthorAndText(line);
 
+      const display = displayLineAuthorAndText(line);
       if (fixed) {
         const badge = document.createElement("span");
         badge.className = "mt-flag";
@@ -1928,7 +2164,6 @@ function toggleAutoIa() {
     localStorage.setItem("__mt_auto_ia", autoIaEnabled ? "1" : "0");
   } catch {}
   if (!autoIaEnabled) cancelAutoIaTimer();
-
   const btn = document.getElementById(UI_IDS.panelAutoIaBtn);
   if (btn) btn.textContent = autoIaEnabled ? "Auto IA: ON" : "Auto IA: OFF";
   setPanelStatus(autoIaEnabled ? "Auto IA ligado ✅" : "Auto IA desligado 📴");
@@ -1970,6 +2205,7 @@ function getRecentLinesForRewriteScan(maxLines = AUTO_FIX_SCAN_LINES) {
 function pickTeamsUnfixedChunk(scanLines, chunkMax = AUTO_FIX_CHUNK_MAX_LINES) {
   const L = Array.isArray(scanLines) ? scanLines : [];
   if (!L.length) return [];
+
   for (let i = L.length - 1; i >= 0; i--) {
     const li = L[i];
     if (!isTeamsLine(li)) continue;
@@ -2002,6 +2238,7 @@ function extractTaggedLines(rewritten, expectedCount) {
 
   const map = new Array(expectedCount).fill(null);
   const re = /⟦L(\d{2})⟧\s*([\s\S]*?)(?=⟦L\d{2}⟧|$)/gu;
+
   let m;
   while ((m = re.exec(raw)) !== null) {
     const idx = parseInt(m[1], 10) - 1;
@@ -2029,12 +2266,14 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
   });
 
   const expected = rawP.length;
+
   const tagged = extractTaggedLines(rewrittenLinesOrText, expected);
   if (tagged) rewrittenLinesOrText = tagged;
 
   let outLines = Array.isArray(rewrittenLinesOrText)
     ? rewrittenLinesOrText
     : String(rewrittenLinesOrText || "").split("\n");
+
   outLines = outLines.map((s) => String(s || "").trim()).filter(Boolean);
   if (!outLines.length) return null;
 
@@ -2067,10 +2306,9 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
     }
 
     newText = normalizeSpacesOneLine(newText);
-
     if (/Teams\s*[•·-]/i.test(newText)) return null;
-
     if (!newText) newText = src.text || "";
+
     safe.push(`${src.origin}: ${src.speaker}: ${newText}`);
   }
 
@@ -2299,6 +2537,7 @@ function requestRepliesForText(text, originLabel = "context") {
     setPanelStatus("Sem texto pra responder.");
     return;
   }
+
   if (!aiAllowedHere()) {
     setPanelStatus("IA: ignorado (iframe).");
     return;
@@ -2313,7 +2552,6 @@ function requestRepliesForText(text, originLabel = "context") {
 
   __mt_clearStreamGuards();
   sugBeginGeneration(["positivo", "negativo"]);
-
   setLauncherState("busy");
 
   safeSendMessage(
@@ -2428,7 +2666,7 @@ function startAutoIaFromTail(opts = {}) {
   const rawLines = getTailLinesForAutoIa(AUTO_IA_MAX_LINES);
   if (!rawLines.length) return;
 
-  // ✅ FIX: "Bloco consolidado" = último bloco + merge só de pipoco (mesmo autor)
+  // ✅ "Bloco consolidado" = último bloco + merge só de pipoco (mesmo autor)
   const seed = buildLastBlockSeedFromLines(rawLines);
   if (!seed) return;
 
@@ -2446,7 +2684,6 @@ function startAutoIaFromTail(opts = {}) {
   if (!correctionEnabled) {
     setPanelStatus(opts.auto ? "Auto IA: consolidando (merge)..." : "Consolidando (merge)...");
     suppressAutoIaForPayload(seed);
-
     const label = opts.auto ? "auto_last_block_merge" : "manual_last_block_merge";
     setPanelStatus(opts.auto ? "Auto IA (streaming)..." : "Gerando (streaming)...");
     requestRepliesForText(seed, label);
@@ -2464,12 +2701,10 @@ function startAutoIaFromTail(opts = {}) {
 
     // ✅ após correção, ainda assim o seed é o ÚLTIMO bloco (com merge pipoco)
     const seed2 = buildLastBlockSeedFromTail(AUTO_IA_MAX_LINES) || seed;
-
     setFixedBlock(seed2);
     suppressAutoIaForPayload(seed2);
 
     setPanelStatus(opts.auto ? "Auto IA (streaming)..." : "Gerando (streaming)...");
-
     const label = opts.auto
       ? didAny
         ? remaining
@@ -2477,10 +2712,10 @@ function startAutoIaFromTail(opts = {}) {
           : "auto_last_block_rewrite"
         : "auto_last_block"
       : didAny
-        ? remaining
-          ? "manual_last_block_rewrite_partial"
-          : "manual_last_block_rewrite"
-        : "manual_last_block";
+      ? remaining
+        ? "manual_last_block_rewrite_partial"
+        : "manual_last_block_rewrite"
+      : "manual_last_block";
 
     requestRepliesForText(seed2, label);
   });
@@ -2513,18 +2748,21 @@ function rewriteSegmentUntilApplied(rawSegLines, triesLeft, cb) {
     if (safeLines && applyRewriteToSegment(segCache, safeLines)) return cb(true);
 
     setFixedBlock((linesOut ? linesOut.join("\n") : rw.text) || "");
-
     if (triesLeft > 0) return setTimeout(() => rewriteSegmentUntilApplied(segCache, triesLeft - 1, cb), 220);
     cb(false);
   });
 }
 
 function __mt_getCurrentLineSeed(originalLine) {
-  const probe = String(originalLine || "").trim().startsWith("🎤") ? String(originalLine).trim() : `🎤 ${String(originalLine || "").trim()}`;
+  const probe = String(originalLine || "").trim().startsWith("🎤")
+    ? String(originalLine).trim()
+    : `🎤 ${String(originalLine || "").trim()}`;
+
   const p = parseTranscriptLine(probe);
   const origin = String(p.origin || "").trim() || "Teams";
   const speaker = String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL;
   const kOS = `${origin}::${speaker}`;
+
   const latestLine = lastSingleLineByKey.get(kOS) || probe;
   return normalizeTranscriptLineForLLM(latestLine);
 }
@@ -2536,7 +2774,6 @@ function generateRepliesForLine(line) {
 
   pauseAutoIa(3000);
   suppressAutoIaForPayload(clean);
-
   setAllSuggestionSlots("");
   setLauncherState("busy");
 
@@ -2570,7 +2807,6 @@ function generateRepliesForLine(line) {
 
   let idx = all.lastIndexOf(tline);
   if (idx < 0) idx = all.length - 1;
-
   const start = Math.max(0, idx - 9);
   const windowLines = all.slice(start, idx + 1);
 
@@ -2632,10 +2868,16 @@ function ensurePanelUI() {
   loadFixedFlags();
   loadSugHistory();
 
+  // ✅ carrega/aplica sizing ANTES de criar o painel
+  __mt_loadPanelSizing();
+  __mt_applyPanelSizing({ clampToViewport: true });
+
   const panel = document.createElement("div");
   panel.id = UI_IDS.panel;
 
   panel.innerHTML = `
+    <div id="${UI_IDS.panelResizeW}" title="Arraste para ajustar a largura"></div>
+
     <div id="${UI_IDS.panelHeader}">
       <div class="title">MT • Viewer</div>
       <div class="actions">
@@ -2655,11 +2897,14 @@ function ensurePanelUI() {
       <div class="mt-transcript-list" id="__mt_transcript_list"></div>
     </div>
 
+    <div id="${UI_IDS.panelResizeH}" title="Arraste para ajustar a divisória"></div>
+
     <div id="${UI_IDS.panelSuggestionsWrap}">
       <div class="mt-fixed-head">
         <div class="mt-fixed-title">Bloco consolidado (merge)</div>
         <button id="${UI_IDS.panelFixedCopy}" class="mt-mini-btn" type="button">Copiar</button>
       </div>
+
       <div id="${UI_IDS.panelFixedBlock}" class="mt-fixed-box">(vazio)</div>
 
       <div class="mt-sug-head" style="margin-top:10px;">
@@ -2688,6 +2933,9 @@ function ensurePanelUI() {
   `;
 
   document.documentElement.appendChild(panel);
+
+  // ✅ instala resizers após inserir no DOM
+  __mt_installPanelResizers(panel);
 
   panel.querySelector(`#${UI_IDS.panelClose}`)?.addEventListener("click", closePanel);
   panel.querySelector(`#${UI_IDS.panelOpenTab}`)?.addEventListener("click", openViewerTab);
@@ -2759,12 +3007,10 @@ function refreshPanel() {
       setPanelStatus("Erro ao buscar estado: " + chrome.runtime.lastError.message);
       return;
     }
-
     const payload = res?.payload || null;
     const bgHistory = String(payload?.fullHistory || "").trim();
     const localHistory = String(transcriptData || "").trim();
     const bestHistory = bgHistory.length >= localHistory.length ? bgHistory : localHistory;
-
     setPanelTranscriptText(bestHistory ? tail(bestHistory, PANEL_HISTORY_MAX_CHARS) : "");
   });
 }
@@ -2813,55 +3059,164 @@ function injectLauncherUI() {
 
   const style = document.createElement("style");
   style.id = UI_IDS.style;
+
   style.textContent = `
-    #${UI_IDS.overlay}{position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:2147483646;display:none;pointer-events:none}
+    #${UI_IDS.overlay}{
+      position:fixed;inset:0;background:rgba(0,0,0,0.35);
+      z-index:2147483646;display:none;pointer-events:none
+    }
     #${UI_IDS.overlay}.active{display:block}
-    #${UI_IDS.bubble}{position:fixed;right:16px;bottom:16px;width:48px;height:48px;border-radius:50%;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(20,20,20,0.92);color:#fff;font:700 12px/1 Arial,sans-serif;letter-spacing:.5px;box-shadow:0 10px 24px rgba(0,0,0,.25);cursor:pointer;user-select:none}
-    #${UI_IDS.bubble} .dot{position:absolute;right:6px;bottom:6px;width:10px;height:10px;border-radius:50%;background:#2ecc71;box-shadow:0 0 0 4px rgba(46,204,113,0.15)}
-    #${UI_IDS.bubble}.busy .dot{background:#f1c40f;box-shadow:0 0 0 4px rgba(241,196,15,0.18);animation:__mt_pulse 900ms ease-in-out infinite}
-    #${UI_IDS.bubble}.error .dot{background:#e74c3c;box-shadow:0 0 0 4px rgba(231,76,60,0.18);animation:none}
+
+    #${UI_IDS.bubble}{
+      position:fixed;right:16px;bottom:16px;width:48px;height:48px;border-radius:50%;
+      z-index:2147483647;display:flex;align-items:center;justify-content:center;
+      background:rgba(20,20,20,0.92);color:#fff;font:700 12px/1 Arial,sans-serif;
+      letter-spacing:.5px;box-shadow:0 10px 24px rgba(0,0,0,.25);
+      cursor:pointer;user-select:none
+    }
+    #${UI_IDS.bubble} .dot{
+      position:absolute;right:6px;bottom:6px;width:10px;height:10px;border-radius:50%;
+      background:#2ecc71;box-shadow:0 0 0 4px rgba(46,204,113,0.15)
+    }
+    #${UI_IDS.bubble}.busy .dot{
+      background:#f1c40f;box-shadow:0 0 0 4px rgba(241,196,15,0.18);
+      animation:__mt_pulse 900ms ease-in-out infinite
+    }
+    #${UI_IDS.bubble}.error .dot{
+      background:#e74c3c;box-shadow:0 0 0 4px rgba(231,76,60,0.18);
+      animation:none
+    }
     #${UI_IDS.bubble}:hover{transform:translateY(-1px)}
     @keyframes __mt_pulse{0%{transform:scale(1)}50%{transform:scale(1.25)}100%{transform:scale(1)}}
-    :root{--mt_panel_w:min(25vw,520px)}
-    #${UI_IDS.panel}{position:fixed;top:0;right:0;width:var(--mt_panel_w);min-width:360px;height:100vh;z-index:2147483645;background:rgba(16,16,18,0.97);color:#fff;border-left:1px solid rgba(255,255,255,0.08);box-shadow:-18px 0 40px rgba(0,0,0,0.35);transform:translateX(100%);transition:transform 160ms ease-out;pointer-events:auto;display:flex;flex-direction:column;font:12px/1.35 Arial,sans-serif}
+
+    :root{--mt_panel_w:min(25vw,520px);--mt_panel_top_h:45vh}
+
+    /* painel */
+    #${UI_IDS.panel}{
+      position:fixed;top:0;right:0;
+      width:var(--mt_panel_w);min-width:360px;height:100vh;
+      z-index:2147483645;background:rgba(16,16,18,0.97);color:#fff;
+      border-left:1px solid rgba(255,255,255,0.08);
+      box-shadow:-18px 0 40px rgba(0,0,0,0.35);
+      transform:translateX(100%);transition:transform 160ms ease-out;
+      pointer-events:auto;display:flex;flex-direction:column;
+      font:12px/1.35 Arial,sans-serif
+    }
     :root.__mt_panel_open #${UI_IDS.panel}{transform:translateX(0)}
     :root.__mt_panel_open body{margin-right:var(--mt_panel_w);overflow-x:hidden}
-    #${UI_IDS.panelHeader}{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;border-bottom:1px solid rgba(255,255,255,0.08)}
+
+    /* handle de largura (borda esquerda do painel) */
+    #${UI_IDS.panelResizeW}{
+      position:absolute;left:0;top:0;bottom:0;width:8px;
+      cursor:ew-resize;touch-action:none;
+      background:linear-gradient(to right, rgba(255,255,255,0.10), rgba(255,255,255,0));
+      opacity:.35
+    }
+    #${UI_IDS.panelResizeW}:hover{opacity:.70}
+
+    #${UI_IDS.panelHeader}{
+      display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:10px;border-bottom:1px solid rgba(255,255,255,0.08)
+    }
     #${UI_IDS.panelHeader} .title{font-weight:900;letter-spacing:.4px}
-    #${UI_IDS.panelHeader} .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    #${UI_IDS.panelHeader} button{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:800 11px/1 Arial,sans-serif;white-space:nowrap}
+    #${UI_IDS.panelHeader} .actions{
+      display:flex;gap:8px;align-items:center;flex-wrap:wrap
+    }
+    #${UI_IDS.panelHeader} button{
+      background:rgba(255,255,255,0.10);color:#fff;
+      border:1px solid rgba(255,255,255,0.14);
+      border-radius:10px;padding:6px 10px;cursor:pointer;
+      font:800 11px/1 Arial,sans-serif;white-space:nowrap
+    }
     #${UI_IDS.panelHeader} button:hover{background:rgba(255,255,255,0.16)}
-    #${UI_IDS.panelStatus}{padding:8px 10px;color:rgba(255,255,255,0.75);border-bottom:1px solid rgba(255,255,255,0.06);font-size:11px}
-    #${UI_IDS.panelTranscript}{padding:10px;overflow:auto;flex:1;border-bottom:1px solid rgba(255,255,255,0.06)}
+
+    #${UI_IDS.panelStatus}{
+      padding:8px 10px;color:rgba(255,255,255,0.75);
+      border-bottom:1px solid rgba(255,255,255,0.06);font-size:11px
+    }
+
+    /* Transcrição (top) agora com altura ajustável */
+    #${UI_IDS.panelTranscript}{
+      padding:10px;overflow:auto;flex:none;
+      height:var(--mt_panel_top_h);min-height:140px;
+      border-bottom:1px solid rgba(255,255,255,0.06)
+    }
+
+    /* divisória horizontal (drag up/down) */
+    #${UI_IDS.panelResizeH}{
+      height:8px;flex:none;cursor:ns-resize;touch-action:none;
+      background:rgba(255,255,255,0.05);
+      border-top:1px solid rgba(255,255,255,0.06);
+      border-bottom:1px solid rgba(255,255,255,0.06)
+    }
+    #${UI_IDS.panelResizeH}:hover{
+      background:rgba(46,204,113,0.10);
+      border-top-color:rgba(46,204,113,0.22);
+      border-bottom-color:rgba(46,204,113,0.22)
+    }
+
+    /* Respostas (bottom) ocupa o resto */
+    #${UI_IDS.panelSuggestionsWrap}{
+      padding:10px;overflow:auto;flex:1;min-height:220px
+    }
+
     .mt-transcript-title{font-weight:900;margin-bottom:8px;color:rgba(255,255,255,0.85)}
     .mt-transcript-list{display:flex;flex-direction:column;gap:6px}
-    .mt-line{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:8px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:rgba(255,255,255,0.04)}
+
+    .mt-line{
+      display:flex;align-items:flex-start;justify-content:space-between;
+      gap:10px;padding:8px;border:1px solid rgba(255,255,255,0.08);
+      border-radius:10px;background:rgba(255,255,255,0.04)
+    }
     .mt-line:hover{background:rgba(255,255,255,0.06)}
     .mt-line.fixed{border-color:rgba(46,204,113,0.55);background:rgba(46,204,113,0.10)}
     .mt-line-text{white-space:pre-wrap;word-break:break-word;flex:1;opacity:.95}
     .mt-flag{display:inline-block;margin-right:6px;font-weight:900}
-    .mt-line-btn{flex:none;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35);border-radius:10px;padding:6px 10px;color:#fff;cursor:pointer;font-weight:900;font-size:11px;line-height:1;white-space:nowrap}
+    .mt-line-btn{
+      flex:none;background:rgba(46,204,113,0.18);
+      border:1px solid rgba(46,204,113,0.35);
+      border-radius:10px;padding:6px 10px;color:#fff;
+      cursor:pointer;font-weight:900;font-size:11px;line-height:1;white-space:nowrap
+    }
     .mt-line-btn:hover{background:rgba(46,204,113,0.24)}
-    #${UI_IDS.panelSuggestionsWrap}{padding:10px;overflow:auto;flex:1}
+
     .mt-fixed-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
     .mt-fixed-title{font-weight:900;color:rgba(255,255,255,0.92)}
-    .mt-fixed-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin-bottom:8px}
-    .mt-mini-btn{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:900 11px/1 Arial,sans-serif;white-space:nowrap}
+    .mt-fixed-box{
+      background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+      border-radius:12px;padding:10px;max-height:160px;overflow:auto;
+      white-space:pre-wrap;word-break:break-word;margin-bottom:8px
+    }
+    .mt-mini-btn{
+      background:rgba(255,255,255,0.10);color:#fff;
+      border:1px solid rgba(255,255,255,0.14);
+      border-radius:10px;padding:6px 10px;cursor:pointer;
+      font:900 11px/1 Arial,sans-serif;white-space:nowrap
+    }
     .mt-mini-btn:hover{background:rgba(255,255,255,0.16)}
     .mt-mini-btn.ok{background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35)}
     .mt-mini-btn.ok:hover{background:rgba(46,204,113,0.24)}
+
     .mt-sug-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px}
     .mt-sug-title{font-weight:900;color:rgba(255,255,255,0.92)}
     .mt-sug-grid{display:grid;grid-template-columns:1fr;gap:10px}
     .mt-sug-card{border:1px solid rgba(255,255,255,0.08);border-radius:12px;background:rgba(255,255,255,0.04);padding:10px}
     .mt-sug-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
     .mt-sug-card-title{font-weight:900;opacity:.95}
-    .mt-sug-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+    .mt-sug-box{
+      background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+      border-radius:12px;padding:10px;max-height:220px;overflow:auto;
+      white-space:pre-wrap;word-break:break-word
+    }
+
     .mt-hist-empty{opacity:.7;padding:6px 2px}
     .mt-hist-wrap{display:flex;flex-direction:column;gap:8px}
     details.mt-hist-item{border:1px solid rgba(255,255,255,0.10);border-radius:12px;background:rgba(255,255,255,0.03);overflow:hidden}
     details.mt-hist-item[open]{border-color:rgba(46,204,113,0.38);background:rgba(46,204,113,0.07)}
-    .mt-hist-sum{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;user-select:none;font-weight:900}
+    .mt-hist-sum{
+      cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:10px;user-select:none;font-weight:900
+    }
     .mt-hist-sum::-webkit-details-marker{display:none}
     .mt-hist-left{display:flex;align-items:center;gap:8px;min-width:0}
     .mt-hist-chevron{width:16px;display:inline-flex;align-items:center;justify-content:center;opacity:.9;flex:none}
@@ -2875,16 +3230,12 @@ function injectLauncherUI() {
     .mt-hist-del{
       background:rgba(255,255,255,0.10);
       border:1px solid rgba(255,255,255,0.16);
-      color:#fff;
-      border-radius:10px;
-      padding:4px 8px;
-      cursor:pointer;
-      font-weight:900;
-      line-height:1;
-      opacity:.95
+      color:#fff;border-radius:10px;padding:4px 8px;
+      cursor:pointer;font-weight:900;line-height:1;opacity:.95
     }
     .mt-hist-del:hover{background:rgba(231,76,60,0.20);border-color:rgba(231,76,60,0.35)}
   `;
+
   document.documentElement.appendChild(style);
 
   const overlay = document.createElement("div");
@@ -2893,13 +3244,15 @@ function injectLauncherUI() {
 
   const bubble = document.createElement("div");
   bubble.id = UI_IDS.bubble;
-  bubble.title = "Clique: abrir/fechar painel | Alt+Clique: viewer em nova aba | Ctrl+Clique: Side Panel | Shift+Clique: Dim on/off | Botão direito: Dim on/off";
+  bubble.title =
+    "Clique: abrir/fechar painel | Alt+Clique: viewer em nova aba | Ctrl+Clique: Side Panel | Shift+Clique: Dim on/off | Botão direito: Dim on/off";
   bubble.innerHTML = `MT<div class="dot"></div>`;
   document.documentElement.appendChild(bubble);
 
   try {
     dimEnabled = localStorage.getItem("__mt_dim_enabled") === "1";
   } catch {}
+
   applyDim(dimEnabled);
 
   bubble.addEventListener("click", (ev) => {
@@ -3005,7 +3358,6 @@ function appendOncePerNode(node, speaker, text, origin) {
     if (prev === sig) return;
     _nodeLastCaptured.set(node, sig);
   }
-
   appendNewTranscript(sp, tx, origin);
 }
 
@@ -3015,7 +3367,6 @@ function appendOncePerNode(node, speaker, text, origin) {
 function cleanCaptionText(t) {
   const s = String(t || "").replace(/\u00A0/g, " ").trim();
   if (!s) return "";
-
   if (/^\s*RTT\b/i.test(s)) return "";
   if (/Pol[ií]tica de Privacidade/i.test(s)) return "";
   if (/Digite uma mensagem/i.test(s)) return "";
@@ -3024,14 +3375,12 @@ function cleanCaptionText(t) {
   if (/Digita(ç|c)ão\s*RTT/i.test(s)) return "";
   if (/texto\s+em\s+tempo\s+real/i.test(s)) return "";
   if (/real[-\s]*time\s+text/i.test(s)) return "";
-
   return s;
 }
 
 function isJunkCaptionText(s) {
   s = String(s || "");
   if (!s) return true;
-
   if (/^\s*RTT\b/i.test(s)) return true;
   if (/Pol[ií]tica de Privacidade/i.test(s)) return true;
   if (/Digite uma mensagem/i.test(s)) return true;
@@ -3040,7 +3389,6 @@ function isJunkCaptionText(s) {
   if (/Digita(ç|c)ão\s*RTT/i.test(s)) return true;
   if (/texto\s+em\s+tempo\s+real/i.test(s)) return true;
   if (/real[-\s]*time\s+text/i.test(s)) return true;
-
   return false;
 }
 
@@ -3126,6 +3474,7 @@ function extractMessageFromRoot(root, speaker) {
     if (filtered.some((x) => normTextKey(x).includes(tk) && normTextKey(x).length >= tk.length + 6)) continue;
     filtered.push(t);
   }
+
   texts = filtered;
 
   let best = texts[0] || "";
@@ -3160,7 +3509,6 @@ function isTinyTokenText(t) {
 function joinDeltaText(prevText, delta) {
   prevText = String(prevText || "").trim();
   delta = String(delta || "").trim();
-
   if (!prevText) return delta;
   if (!delta) return prevText;
 
@@ -3207,7 +3555,6 @@ function tryMergeTeamsDeltaIntoLastLine(origin, speaker, deltaText) {
   if (mergedText.length > TEAMS_PIPOCA_MAX_LINE_CHARS) return false;
 
   const updatedSingle = `🎤 ${origin}: ${speaker}: ${mergedText}`;
-
   replaceLastLineInCaches(oldSingle, updatedSingle);
   lastSingleLineByKey.set(kOS, updatedSingle);
   lastAppendAtByKey.set(kOS, now);
@@ -3259,12 +3606,12 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
 
   const kOS = `${origin}::${speaker}`;
   const prevLine = lastLineByKey.get(kOS) || "";
+
   let newContent = cleanText;
 
   // delta guard
   if (prevLine && cleanText.startsWith(prevLine)) {
     const remainder = normalizeSpacesOneLine(cleanText.slice(prevLine.length));
-
     if (originLower === "teams") {
       const remK = normTextKey(remainder);
       const prevK = normTextKey(prevLine);
@@ -3273,7 +3620,6 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
         return;
       }
     }
-
     newContent = remainder;
   }
 
@@ -3343,13 +3689,10 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
       trimHistoryIfNeeded();
       lastSingleLineByKey.set(kOS, singleLineNew);
       lastAppendAtByKey.set(kOS, now);
-
       try {
         latestBySpeaker.delete(prev.speaker);
       } catch {}
-
       recentText.set(textKey, { ts: now, speaker, line: singleLineNew });
-
       markTranscriptActivity();
       scheduleFlushSoon();
       return;
@@ -3372,6 +3715,7 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   latestBySpeaker.set(speaker, previous ? `${previous} ${newContent}` : newContent);
 
   safeSendMessage({ action: "transcriptTick", payload: { line: singleLine, timestamp: nowIso() } });
+
   markTranscriptActivity();
   scheduleFlushSoon();
 }
@@ -3417,13 +3761,13 @@ const captureTeamsRTT = () => {
 
   for (const authorEl of authorEls) {
     const speaker = cleanCaptionText(authorEl.innerText) || UNKNOWN_SPEAKER_LABEL;
+
     let root =
       authorEl.closest(".fui-ChatMessageCompact") ||
       authorEl.closest('[role="listitem"]') ||
       authorEl.closest("li") ||
       authorEl.closest("div");
     if (!root) continue;
-
     if (root.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
 
     let msg = "";
@@ -3451,6 +3795,7 @@ const captureTeamsCaptionsV2 = () => {
     wrapper.querySelector('[data-tid="closed-caption-v2-virtual-list-content"]') || wrapper;
 
   const authorEls = list.querySelectorAll('span[data-tid="author"]');
+
   if (authorEls && authorEls.length) {
     for (const authorEl of authorEls) {
       const speaker = cleanCaptionText(authorEl.innerText) || UNKNOWN_SPEAKER_LABEL;
@@ -3461,7 +3806,6 @@ const captureTeamsCaptionsV2 = () => {
         authorEl.closest("div") ||
         authorEl.parentElement;
       if (!root) continue;
-
       if (root.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
 
       let msg = "";
@@ -3486,7 +3830,10 @@ const captureTeamsCaptionsV2 = () => {
   }
 
   // fallback: itens
-  const items = list.querySelectorAll('[role="listitem"], [data-tid*="closed-caption"], .ui-box, .fui-ChatMessageCompact');
+  const items = list.querySelectorAll(
+    '[role="listitem"], [data-tid*="closed-caption"], .ui-box, .fui-ChatMessageCompact'
+  );
+
   for (const item of items) {
     if (item.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
     const rawBest = bestLeafText(item);
@@ -3515,8 +3862,7 @@ const captureTeams = () => {
 
 const captureSlack = () => {
   document.querySelectorAll(".p-huddle_event_log__base_event").forEach((event) => {
-    const speaker =
-      event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
+    const speaker = event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
     const text = event.querySelector(".p-huddle_event_log__transcription")?.innerText?.trim();
     if (text) appendOncePerNode(event, speaker, text, "Slack");
   });
