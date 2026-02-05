@@ -18,6 +18,7 @@
    - ✅ FIX NOVO: Sugestões viram HISTÓRICO (não sobrescreve) + preserva leitura durante streaming
    - ✅ FIX NOVO: Bloco consolidado não “acumula” repetição (dedupe extra no merge delta / display)
    - ✅ FIX NOVO: Bloco consolidado mostra SOMENTE o ÚLTIMO bloco (merge só de “pipoco”)
+   - ✅ NEW: Export da conversa (TXT / Alt+Clique JSON), Limpar histórico, e ✕ por item do histórico de sugestões
 */
 
 "use strict";
@@ -181,6 +182,10 @@ const UI_IDS = {
   // ✅ bloco consolidado (merge/IA)
   panelFixedBlock: "__mt_fixed_block",
   panelFixedCopy: "__mt_fixed_copy",
+
+  // ✅ export + clear
+  panelExportBtn: "__mt_side_panel_export_btn",
+  panelClearBtn: "__mt_side_panel_clear_btn",
 };
 
 // =====================================================
@@ -798,6 +803,200 @@ function copyToClipboard(text) {
 }
 
 // =====================================================
+// ✅ Export + Clear history
+// =====================================================
+function __mt_stamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const mi = pad(d.getMinutes());
+  const ss = pad(d.getSeconds());
+  return `${yyyy}${mm}${dd}_${hh}${mi}${ss}`;
+}
+
+function __mt_download(filename, text, mime = "text/plain;charset=utf-8") {
+  try {
+    const blob = new Blob([String(text || "")], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.style.display = "none";
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    return true;
+  } catch (e) {
+    console.warn("[MT] download failed:", e);
+    return false;
+  }
+}
+
+function __mt_buildExportPlainText() {
+  const lines = [];
+  lines.push(`MT Export`);
+  lines.push(`exportedAt: ${nowIso()}`);
+  lines.push(`url: ${String(location.href || "")}`);
+  lines.push("");
+
+  lines.push("=== TRANSCRIPT (fullHistory) ===");
+  lines.push(String(transcriptData || "").trim() || "(vazio)");
+  lines.push("");
+
+  lines.push("=== PANEL TAIL (panelTranscriptCache) ===");
+  lines.push(String(panelTranscriptCache || "").trim() || "(vazio)");
+  lines.push("");
+
+  lines.push("=== FIXED BLOCK (panelFixedBlockCache) ===");
+  lines.push(String(panelFixedBlockCache || "").trim() || "(vazio)");
+  lines.push("");
+
+  const dumpSug = (slot) => {
+    const st = sugState[sugSlotNorm(slot)];
+    const items = Array.isArray(st?.items) ? st.items : [];
+    lines.push(`=== SUGGESTIONS (${slot.toUpperCase()}) ===`);
+    if (!items.length) {
+      lines.push("(sem respostas)");
+      lines.push("");
+      return;
+    }
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      lines.push(
+        `--- #${i + 1} id=${it.id} ts=${new Date(it.ts || Date.now()).toISOString()} done=${it.done !== false}`
+      );
+      lines.push(String(it.text || "").trim());
+      lines.push("");
+    }
+  };
+
+  dumpSug("positivo");
+  dumpSug("negativo");
+
+  return lines.join("\n").trim() + "\n";
+}
+
+function exportConversation(ev) {
+  const stamp = __mt_stamp();
+  const base = `mt_export_${stamp}`;
+
+  // default: TXT (humano)
+  const txt = __mt_buildExportPlainText();
+  const okTxt = __mt_download(`${base}.txt`, txt, "text/plain;charset=utf-8");
+
+  // Alt+Clique: exporta JSON (estruturado)
+  if (ev?.altKey) {
+    const payload = {
+      exportedAt: nowIso(),
+      url: String(location.href || ""),
+      transcriptData: String(transcriptData || ""),
+      panelTranscriptCache: String(panelTranscriptCache || ""),
+      panelFixedBlockCache: String(panelFixedBlockCache || ""),
+      suggestions: {
+        positivo: (sugState?.positivo?.items || []).slice(0, SUG_HISTORY_MAX),
+        negativo: (sugState?.negativo?.items || []).slice(0, SUG_HISTORY_MAX),
+      },
+      settings: {
+        autoIaEnabled: !!autoIaEnabled,
+        correctionEnabled: !!correctionEnabled,
+        dimEnabled: !!dimEnabled,
+      },
+      version: "mt_export_v1",
+    };
+    __mt_download(`${base}.json`, JSON.stringify(payload, null, 2), "application/json;charset=utf-8");
+  }
+
+  setPanelStatus(okTxt ? "Exportado ✅" : "Falha ao exportar ❌");
+}
+
+function clearAllHistory(askConfirm = true) {
+  if (askConfirm) {
+    const ok = confirm("Limpar histórico? (Transcrição + sugestões + flags).");
+    if (!ok) return;
+  }
+
+  // pausa IA/locks
+  cancelAutoIaTimer();
+  __mt_clearStreamGuards();
+  repliesInFlight = false;
+  repliesLockUntil = 0;
+  lastReplyKey = "";
+  lastReplyAt = 0;
+  rewriteInFlight = false;
+  lastRewriteRequestKey = "";
+
+  // limpa buffers/maps do transcript
+  transcriptData = "";
+  lastSavedHash = "";
+  lastLineByKey = new Map();
+  seenKeys = new Set();
+  latestBySpeaker = new Map();
+  lastSingleLineByKey = new Map();
+  lastAppendAtByKey = new Map();
+  recentText.clear();
+
+  // heurísticas de speaker
+  try {
+    recentNonUnknownSpeakers.clear();
+  } catch {}
+
+  // Teams RTT buffers
+  try {
+    teamsRttBuf.clear();
+  } catch {}
+  try {
+    teamsRttLastCommitted.clear();
+  } catch {}
+  stopTeamsRttTimerIfIdle();
+
+  // painel
+  panelTranscriptCache = "";
+  panelFixedBlockCache = "";
+  panelLineSet.clear();
+
+  // limpa sugestões
+  sugState.positivo.items = [];
+  sugState.negativo.items = [];
+  sugState.positivo.openId = null;
+  sugState.negativo.openId = null;
+  sugState.positivo.liveId = null;
+  sugState.negativo.liveId = null;
+
+  // limpa flags
+  try {
+    fixedLineFlags.clear();
+  } catch {}
+
+  // storage (não mexe em __mt_auto_ia / __mt_correction / __mt_dim_enabled)
+  try {
+    localStorage.removeItem(SUG_HISTORY_STORE_KEY);
+  } catch {}
+  try {
+    localStorage.removeItem(FIXED_FLAGS_STORE_KEY);
+  } catch {}
+
+  // re-render UI
+  setPanelTranscriptText("");
+  setFixedBlock("");
+  sugRender("positivo");
+  sugRender("negativo");
+  setLauncherState("ok");
+  setPanelStatus("Histórico limpo 🧹");
+
+  // ✅ limpa também no background (pra refresh não “voltar”)
+  try {
+    safeSendMessage(
+      { action: "transcriptData", payload: { fullHistory: "", latestLine: "", filename: "" } },
+      () => {}
+    );
+  } catch {}
+}
+
+// =====================================================
 // ✅ Suggestions UI (2 slots) — HISTÓRICO (não sobrescreve)
 // =====================================================
 const SUG_HISTORY_STORE_KEY = "__mt_sug_history_v1";
@@ -920,6 +1119,24 @@ function sugEnsureOpenId(slot) {
   st.openId = st.items[0]?.id || null;
 }
 
+// ✅ delete do histórico (por slot)
+function sugDelete(slot, id) {
+  slot = sugSlotNorm(slot);
+  const st = sugState[slot];
+  const before = (st.items || []).length;
+
+  st.items = (st.items || []).filter((x) => x && x.id !== id);
+
+  if (st.openId === id) st.openId = st.items[0]?.id || null;
+  if (st.liveId === id) st.liveId = null;
+
+  if ((st.items || []).length !== before) {
+    saveSugHistorySoon();
+    sugRender(slot);
+    setPanelStatus("Sugestão removida 🗑️");
+  }
+}
+
 function sugRender(slot) {
   slot = sugSlotNorm(slot);
   const host = sugHost(slot);
@@ -988,6 +1205,19 @@ function sugRender(slot) {
 
       right.appendChild(ts);
       right.appendChild(state);
+
+      // ✅ botão ✕ (delete item)
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "mt-hist-del";
+      del.textContent = "✕";
+      del.title = "Excluir esta resposta";
+      del.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        sugDelete(slot, it.id);
+      });
+      right.appendChild(del);
 
       summary.appendChild(left);
       summary.appendChild(right);
@@ -2411,6 +2641,8 @@ function ensurePanelUI() {
       <div class="actions">
         <button id="${UI_IDS.panelAutoIaBtn}" title="Auto IA (1s)">${autoIaEnabled ? "Auto IA: ON" : "Auto IA: OFF"}</button>
         <button id="${UI_IDS.panelCorrectionBtn}" title="Correção (IA) de pipocos (opcional)">${correctionEnabled ? "Correção: ON" : "Correção: OFF"}</button>
+        <button id="${UI_IDS.panelExportBtn}" title="Exportar conversa (TXT). Alt+Clique: JSON">Export</button>
+        <button id="${UI_IDS.panelClearBtn}" title="Limpar histórico (transcrição + sugestões + flags)">Limpar</button>
         <button id="${UI_IDS.panelOpenTab}" title="Abrir viewer.html em nova aba">↗</button>
         <button id="${UI_IDS.panelClose}" title="Fechar">✕</button>
       </div>
@@ -2461,6 +2693,19 @@ function ensurePanelUI() {
   panel.querySelector(`#${UI_IDS.panelOpenTab}`)?.addEventListener("click", openViewerTab);
   panel.querySelector(`#${UI_IDS.panelAutoIaBtn}`)?.addEventListener("click", toggleAutoIa);
   panel.querySelector(`#${UI_IDS.panelCorrectionBtn}`)?.addEventListener("click", toggleCorrection);
+
+  // ✅ export + clear
+  panel.querySelector(`#${UI_IDS.panelExportBtn}`)?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    exportConversation(ev);
+  });
+
+  panel.querySelector(`#${UI_IDS.panelClearBtn}`)?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    clearAllHistory(true);
+  });
 
   panel.querySelector("#__mt_btn_manual_tail")?.addEventListener("click", (ev) => {
     ev.preventDefault();
@@ -2627,6 +2872,18 @@ function injectLauncherUI() {
     .mt-hist-right{display:flex;align-items:center;gap:10px;opacity:.85;font-weight:800}
     .mt-hist-ts{font-size:11px}
     .mt-hist-body{padding:10px;border-top:1px solid rgba(255,255,255,0.08);white-space:pre-wrap;word-break:break-word}
+    .mt-hist-del{
+      background:rgba(255,255,255,0.10);
+      border:1px solid rgba(255,255,255,0.16);
+      color:#fff;
+      border-radius:10px;
+      padding:4px 8px;
+      cursor:pointer;
+      font-weight:900;
+      line-height:1;
+      opacity:.95
+    }
+    .mt-hist-del:hover{background:rgba(231,76,60,0.20);border-color:rgba(231,76,60,0.35)}
   `;
   document.documentElement.appendChild(style);
 
