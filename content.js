@@ -17,6 +17,7 @@
    - ✅ FIX: clique "Responder (2)" NÃO duplica respostas (callback final + stream)
    - ✅ FIX NOVO: Sugestões viram HISTÓRICO (não sobrescreve) + preserva leitura durante streaming
    - ✅ FIX NOVO: Bloco consolidado não “acumula” repetição (dedupe extra no merge delta / display)
+   - ✅ FIX NOVO: Bloco consolidado mostra SOMENTE o ÚLTIMO bloco (merge só de “pipoco”)
 */
 
 "use strict";
@@ -34,14 +35,20 @@ function parseRewriteResponse(res) {
   if (!res || typeof res !== "object") return null;
   const text = String(res.text || "").trim();
   const lines = Array.isArray(res.lines)
-    ? res.lines.map((s) => String(s || "").trim()).filter(Boolean)
+    ? res.lines
+        .map((s) => String(s || "").trim())
+        .filter(Boolean)
     : null;
 
   let outLines = lines;
 
   // fallback: tenta extrair linhas do texto quando vier em bloco
   if ((!outLines || !outLines.length) && text) {
-    const parts = text.split("\n").map((s) => s.trim()).filter(Boolean);
+    const parts = text
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     // “Origin: Speaker: Text” => tem pelo menos 2 “:”
     const good = parts.filter((s) => (s.match(/:/g) || []).length >= 2);
     if (good.length) outLines = good;
@@ -157,16 +164,20 @@ const UI_IDS = {
   panelOpenTab: "__mt_side_panel_open_tab",
   panelStatus: "__mt_side_panel_status",
   panelTranscript: "__mt_side_panel_transcript",
+
   // suggestions (2 rotas)
   panelSuggestionsWrap: "__mt_side_panel_suggestions_wrap",
   panelSuggestionPos: "__mt_side_panel_suggestion_pos",
   panelSuggestionNeg: "__mt_side_panel_suggestion_neg",
   panelSugCopyPos: "__mt_side_panel_copy_pos",
   panelSugCopyNeg: "__mt_side_panel_copy_neg",
+
   // auto toggle
   panelAutoIaBtn: "__mt_side_panel_auto_ia_btn",
+
   // ✅ toggle correção
   panelCorrectionBtn: "__mt_side_panel_correction_btn",
+
   // ✅ bloco consolidado (merge/IA)
   panelFixedBlock: "__mt_fixed_block",
   panelFixedCopy: "__mt_fixed_copy",
@@ -177,6 +188,7 @@ const UI_IDS = {
 // =====================================================
 let transcriptData = "";
 let lastSavedHash = "";
+
 // ✅ FIX: “prevLine” por origin+speaker
 let lastLineByKey = new Map(); // key(origin::speaker) -> last full text
 let seenKeys = new Set();
@@ -190,15 +202,18 @@ let lastAppendAtByKey = new Map(); // origin::speaker -> ts (p/ merge pipoco)
 function nowIso() {
   return new Date().toISOString();
 }
+
 function tail(str, max) {
   str = String(str || "");
   if (!max || str.length <= max) return str;
   return str.slice(str.length - max);
 }
+
 function trimHistoryIfNeeded() {
   if (transcriptData.length <= MAX_HISTORY_CHARS) return;
   transcriptData = transcriptData.slice(transcriptData.length - MAX_HISTORY_CHARS);
 }
+
 // ✅ sempre 1 linha
 function normalizeSpacesOneLine(s) {
   return String(s || "")
@@ -216,12 +231,12 @@ function normalizeSpacesOneLine(s) {
 function __mt_escapeColonInBody(s) {
   return String(s || "")
     .replace(/:/g, "∶")
-    // limpa casos comuns do Teams tipo "bem:?" -> "bem?"
     .replace(/\s*∶\s*\?/g, "?")
     .replace(/\s*∶\s*!/g, "!")
     .replace(/\s*∶\s*\./g, ".")
     .replace(/\s*∶\s*,/g, ",");
 }
+
 function __mt_sanitizeAiLine(rawLine) {
   const raw = String(rawLine || "").trim();
   if (!raw) return "";
@@ -229,19 +244,21 @@ function __mt_sanitizeAiLine(rawLine) {
   // tenta preservar estrutura "Origin: Speaker: Text"
   const probe = raw.startsWith("🎤") ? raw : `🎤 ${raw}`;
   const p = parseTranscriptLine(probe);
-
   if (p && p.origin && p.speaker) {
     const safeText = __mt_escapeColonInBody(p.text || "");
     return `${String(p.origin).trim()}: ${String(p.speaker).trim()}: ${safeText}`.trim();
   }
+
   // fallback (texto solto): ainda assim evita ":" quebrando parser
   return __mt_escapeColonInBody(raw.replace(/^🎤\s*/u, ""));
 }
+
 function __mt_sanitizeAiPayload(rawText) {
   const lines = String(rawText || "")
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+
   if (!lines.length) return "";
   return lines.map(__mt_sanitizeAiLine).join("\n").trim();
 }
@@ -271,14 +288,17 @@ function parseTranscriptLine(line) {
     text: (m[3] || "").trim(),
   };
 }
+
 function isTeamsLine(line) {
   const p = parseTranscriptLine(line);
   return String(p.origin || "").trim().toLowerCase() === "teams";
 }
+
 function hasFinalPunct(s) {
   const t = String(s || "").trim();
   return /[.!?…]$/.test(t);
 }
+
 function isOnlyPunctDelta(s) {
   const t = String(s || "").trim();
   return /^[.!?…]+$/.test(t);
@@ -294,11 +314,14 @@ function normName(s) {
     .replace(/\s+/g, "")
     .replace(/[^\p{L}\p{N}]/gu, "");
 }
+
 const myKnownNameNorms = new Set([normName("Você"), normName("Leonel Dorneles Porto")]);
+
 function addMyName(name) {
   const n = normName(name);
   if (n) myKnownNameNorms.add(n);
 }
+
 function isMe(name) {
   return myKnownNameNorms.has(normName(name));
 }
@@ -308,6 +331,7 @@ function isMe(name) {
 // =====================================================
 const FIXED_FLAGS_STORE_KEY = "__mt_fixed_line_flags_v1";
 const FIXED_FLAGS_MAX = 2500;
+
 let fixedLineFlags = new Map(); // key -> ts
 let fixedFlagsLoaded = false;
 let fixedFlagsSaveTimer = null;
@@ -318,6 +342,7 @@ function normTextKey(s) {
     .replace(/\s+/g, " ")
     .trim();
 }
+
 function fastHash(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
@@ -326,13 +351,16 @@ function fastHash(str) {
   }
   return String(h >>> 0);
 }
+
 function lineFlagKey(line) {
   const clean = normTextKey(String(line || "").replace(/^🎤\s*/u, "").trim());
   return clean ? fastHash(clean) : "";
 }
+
 function loadFixedFlags() {
   if (fixedFlagsLoaded) return;
   fixedFlagsLoaded = true;
+
   try {
     const raw = localStorage.getItem(FIXED_FLAGS_STORE_KEY);
     if (!raw) return;
@@ -350,6 +378,7 @@ function loadFixedFlags() {
     }
   } catch {}
 }
+
 function scheduleSaveFixedFlags() {
   try {
     if (fixedFlagsSaveTimer) clearTimeout(fixedFlagsSaveTimer);
@@ -362,19 +391,24 @@ function scheduleSaveFixedFlags() {
     }, 400);
   } catch {}
 }
+
 function markLineFixed(line) {
   loadFixedFlags();
   const k = lineFlagKey(line);
   if (!k) return;
+
   fixedLineFlags.delete(k);
   fixedLineFlags.set(k, Date.now());
+
   while (fixedLineFlags.size > FIXED_FLAGS_MAX) {
     const first = fixedLineFlags.keys().next().value;
     if (!first) break;
     fixedLineFlags.delete(first);
   }
+
   scheduleSaveFixedFlags();
 }
+
 function isLineFixed(line) {
   loadFixedFlags();
   const k = lineFlagKey(line);
@@ -395,6 +429,7 @@ function collapseTeamsRepeats(text) {
       if (words.length % rep !== 0) continue;
       const patLen = words.length / rep;
       if (patLen < 6) continue;
+
       const pat = words.slice(0, patLen).join(" ");
       let ok = true;
       for (let r = 1; r < rep; r++) {
@@ -412,7 +447,8 @@ function collapseTeamsRepeats(text) {
   const segsRaw = s.match(/[^.!?…]+[.!?…]*/g) || [];
   const segs = segsRaw.map((x) => normalizeSpacesOneLine(x)).filter(Boolean);
   if (segs.length >= 2) {
-    const canon = (x) => normTextKey(String(x || "").replace(/[.!?…,"'“”‘’]/g, " "));
+    const canon = (x) =>
+      normTextKey(String(x || "").replace(/[.!?…,"'“”‘’]/g, " "));
 
     // remove duplicadas consecutivas
     const compact = [];
@@ -469,6 +505,7 @@ function isUnknownSpeaker(s) {
   const t = String(s || "").trim().toLowerCase();
   return !t || t === "desconhecido" || t === "unknown";
 }
+
 const UNKNOWN_SPEAKER_LABEL = "Desconhecido";
 const SINGLE_SPEAKER_GUESS_UNKNOWN = true;
 const SINGLE_SPEAKER_GUESS_WINDOW_MS = 120000;
@@ -486,12 +523,14 @@ function noteNonUnknownSpeaker(name) {
     if (!v || v.ts < cutoff) recentNonUnknownSpeakers.delete(k);
   }
 }
+
 function guessSpeakerIfUnknown(speaker) {
   if (!SINGLE_SPEAKER_GUESS_UNKNOWN) return speaker;
   if (!isUnknownSpeaker(speaker)) return speaker;
 
   const now = Date.now();
   const cutoff = now - SINGLE_SPEAKER_GUESS_WINDOW_MS;
+
   const uniq = [];
   for (const v of recentNonUnknownSpeakers.values()) {
     if (!v || v.ts < cutoff) continue;
@@ -499,6 +538,7 @@ function guessSpeakerIfUnknown(speaker) {
     if (!nn) continue;
     if (!uniq.some((x) => normName(x.name) === nn)) uniq.push(v);
   }
+
   if (uniq.length === 1) return uniq[0].name;
   return speaker;
 }
@@ -518,10 +558,12 @@ function rebuildPanelLineSetFromCache() {
     .filter(Boolean);
   for (const ln of lines) panelLineSet.add(ln);
 }
+
 function transcriptCacheHasLine(line) {
   const ln = String(line || "").trim();
   return !!ln && panelLineSet.has(ln);
 }
+
 function normalizeTranscriptLineForLLM(line) {
   return String(line || "").replace(/^🎤\s*/u, "").trim();
 }
@@ -589,6 +631,7 @@ let lastReplyAt = 0;
 function aiAllowedHere() {
   return !AI_ONLY_TOP_FRAME || IS_TOP_FRAME;
 }
+
 function releaseReplyLockIfExpired() {
   const now = Date.now();
   if (repliesInFlight && now >= repliesLockUntil) {
@@ -596,12 +639,14 @@ function releaseReplyLockIfExpired() {
     repliesLockUntil = 0;
   }
 }
+
 function bumpReplyLock(ms = STREAM_LOCK_BUMP_MS) {
   if (!aiAllowedHere()) return;
   const now = Date.now();
   repliesInFlight = true;
   repliesLockUntil = Math.max(repliesLockUntil || 0, now + Math.max(250, ms | 0));
 }
+
 function tryAcquireReplyLock(payloadStr) {
   if (!aiAllowedHere()) return { ok: false, reason: "not_top_frame" };
   releaseReplyLockIfExpired();
@@ -611,19 +656,24 @@ function tryAcquireReplyLock(payloadStr) {
   if (!payload) return { ok: false, reason: "empty" };
 
   const key = fastHash(payload);
+
   if (key === lastReplyKey && now - lastReplyAt < REPLY_DEDUP_MS) {
     return { ok: false, reason: "dedup" };
   }
+
   if (repliesInFlight && now < repliesLockUntil) {
     return { ok: false, reason: "in_flight" };
   }
 
   lastReplyKey = key;
   lastReplyAt = now;
+
   repliesInFlight = true;
   repliesLockUntil = now + REPLY_LOCK_MS;
+
   return { ok: true, key };
 }
+
 function finishReplyLock() {
   const now = Date.now();
   repliesInFlight = false;
@@ -643,15 +693,18 @@ function loadCorrectionSetting() {
     if (v === "0") correctionEnabled = false;
   } catch {}
 }
+
 function saveCorrectionSetting() {
   try {
     localStorage.setItem("__mt_correction", correctionEnabled ? "1" : "0");
   } catch {}
 }
+
 function updateCorrectionBtn() {
   const btn = document.getElementById(UI_IDS.panelCorrectionBtn);
   if (btn) btn.textContent = correctionEnabled ? "Correção: ON" : "Correção: OFF";
 }
+
 function toggleCorrection() {
   correctionEnabled = !correctionEnabled;
   saveCorrectionSetting();
@@ -668,6 +721,7 @@ function stopTranscriber(reason) {
   if (startTimeoutId) clearTimeout(startTimeoutId);
   if (flushDebounceId) clearTimeout(flushDebounceId);
   cancelAutoIaTimer();
+
   if (teamsRttTimerId) {
     clearInterval(teamsRttTimerId);
     teamsRttTimerId = null;
@@ -745,14 +799,11 @@ function copyToClipboard(text) {
 
 // =====================================================
 // ✅ Suggestions UI (2 slots) — HISTÓRICO (não sobrescreve)
-// - ✅ Guarda N respostas
-// - ✅ Se estiver lendo um item, streaming NÃO fecha leitura
-// - ✅ Quando finalizar a resposta mais nova, ela abre e fecha a anterior
 // =====================================================
 const SUG_HISTORY_STORE_KEY = "__mt_sug_history_v1";
-const SUG_HISTORY_MAX = 10; // ✅ antes era 1; agora mantém histórico
-let __sugSeq = 0;
+const SUG_HISTORY_MAX = 10;
 
+let __sugSeq = 0;
 const sugState = {
   positivo: { items: [], openId: null, liveId: null },
   negativo: { items: [], openId: null, liveId: null },
@@ -761,10 +812,12 @@ const sugState = {
 function sugSlotNorm(slot) {
   return slot === "negativo" ? "negativo" : "positivo";
 }
+
 function sugId() {
   __sugSeq = (__sugSeq + 1) | 0;
   return `s${Date.now()}_${__sugSeq}`;
 }
+
 function sugTimeLabel(ts) {
   try {
     const d = new Date(ts);
@@ -776,13 +829,13 @@ function sugTimeLabel(ts) {
     return "";
   }
 }
+
 function sugHost(slot) {
   slot = sugSlotNorm(slot);
   return document.getElementById(slot === "positivo" ? UI_IDS.panelSuggestionPos : UI_IDS.panelSuggestionNeg);
 }
 
 let __sugSaveTimer = null;
-
 function saveSugHistorySoon() {
   try {
     if (__sugSaveTimer) clearTimeout(__sugSaveTimer);
@@ -793,7 +846,6 @@ function saveSugHistorySoon() {
           v: 2,
           positivo: (sugState.positivo.items || []).slice(0, SUG_HISTORY_MAX),
           negativo: (sugState.negativo.items || []).slice(0, SUG_HISTORY_MAX),
-          // opcional: não persistimos openId pra não “surpreender” após reload
         };
         localStorage.setItem(SUG_HISTORY_STORE_KEY, JSON.stringify(payload));
       } catch {}
@@ -822,11 +874,9 @@ function loadSugHistory() {
     sugState.positivo.items = normArr(obj.positivo);
     sugState.negativo.items = normArr(obj.negativo);
 
-    // não restaura liveId; se existia, trata como finalizado
     sugState.positivo.liveId = null;
     sugState.negativo.liveId = null;
 
-    // openId: por padrão abre o mais recente
     sugState.positivo.openId = sugState.positivo.items[0]?.id || null;
     sugState.negativo.openId = sugState.negativo.items[0]?.id || null;
   } catch {}
@@ -855,7 +905,6 @@ function sugOpenOnly(slot, id) {
   const host = sugHost(slot);
   if (!host) return;
 
-  // fecha todos os outros no DOM
   host.querySelectorAll("details.mt-hist-item").forEach((d) => {
     if (d.dataset?.id !== id) d.open = false;
   });
@@ -883,6 +932,7 @@ function sugRender(slot) {
 
   withBoxScrollPreserved(host, () => {
     host.innerHTML = "";
+
     if (!items.length) {
       const empty = document.createElement("div");
       empty.className = "mt-hist-empty";
@@ -901,9 +951,6 @@ function sugRender(slot) {
       details.className = "mt-hist-item";
       details.dataset.id = it.id;
 
-      // ✅ mantém a leitura do usuário durante streaming:
-      // - se openId aponta pra outro, este NÃO abre sozinho
-      // - quando finaliza, nós setamos openId pro mais novo (ver finalize)
       details.open = st.openId ? st.openId === it.id : idx === 0;
 
       const summary = document.createElement("summary");
@@ -952,7 +999,6 @@ function sugRender(slot) {
       details.appendChild(summary);
       details.appendChild(body);
 
-      // toggle: quando abre um, fecha os outros
       details.addEventListener("toggle", () => {
         if (details.open) {
           sugOpenOnly(slot, it.id);
@@ -980,7 +1026,6 @@ function sugStartLive(slot) {
   slot = sugSlotNorm(slot);
   const st = sugState[slot];
 
-  // se tinha live antigo, finaliza como "done" antes de iniciar novo
   if (st.liveId) {
     const prev = (st.items || []).find((x) => x.id === st.liveId);
     if (prev) prev.done = true;
@@ -990,13 +1035,9 @@ function sugStartLive(slot) {
   const id = sugId();
   const it = { id, ts: Date.now(), text: "", done: false };
 
-  // ✅ NÃO sobrescreve: insere no topo e mantém histórico
   st.items = [it].concat((st.items || []).filter((x) => x && x.id !== id));
-
   st.liveId = id;
 
-  // ✅ se o usuário não está lendo nada (openId null), abre o live
-  // ✅ se está lendo (openId set), NÃO mexe agora (preserva leitura)
   if (!st.openId) st.openId = id;
 
   sugPrune(slot);
@@ -1008,17 +1049,12 @@ function sugStartLive(slot) {
 function sugUpdateLive(slot, text) {
   slot = sugSlotNorm(slot);
   const st = sugState[slot];
-
   const t = tail(String(text || ""), 12000);
-
   if (!st.liveId) sugStartLive(slot);
-
   const it = (st.items || []).find((x) => x.id === st.liveId);
   if (!it) return;
-
   it.text = t;
   it.done = false;
-
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
@@ -1033,35 +1069,29 @@ function sugFinalizeLive(slot) {
   if (it) {
     it.done = true;
     it.ts = Date.now();
-
-    // ✅ AGORA sim: abre a mais atual e fecha a anterior
     st.openId = it.id;
   }
 
   st.liveId = null;
-
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
 }
 
-// ✅ DEDUPE FORTE (match por hash normalizado; reaproveita item existente)
+// ✅ DEDUPE FORTE
 function __mt_normHash(t) {
   return fastHash(normTextKey(String(t || "").trim()));
 }
 
-// adiciona final sem sobrescrever histórico
 function sugAddFinal(slot, text) {
   slot = sugSlotNorm(slot);
   const st = sugState[slot];
-
   const t = tail(String(text || ""), 12000).trim();
   if (!t) return;
 
   const now = Date.now();
   const h = __mt_normHash(t);
 
-  // se o mais recente já é igual, atualiza e abre
   if (st.items && st.items.length) {
     const cur = st.items[0];
     if (cur?.text && __mt_normHash(cur.text) === h) {
@@ -1077,21 +1107,16 @@ function sugAddFinal(slot, text) {
     }
   }
 
-  // cria novo item no topo
   const it = { id: sugId(), ts: now, text: t, done: true };
   st.items = [it].concat((st.items || []).slice(0, SUG_HISTORY_MAX - 1));
-  st.openId = it.id; // abre a mais atual e fecha a anterior
+  st.openId = it.id;
   st.liveId = null;
-
   sugPrune(slot);
   saveSugHistorySoon();
   sugRender(slot);
 }
 
-// Compat antigo: não apaga histórico (mantém)
 function setAllSuggestionSlots(_) {}
-
-// Compat antigo: stream escreve no "live"
 function setSuggestionSlot(slot, raw) {
   slot = sugSlotNorm(slot);
   sugUpdateLive(slot, raw);
@@ -1102,7 +1127,6 @@ function setSuggestionSlot(slot, raw) {
 // =====================================================
 let __mt_ignoreStreamUntil = 0;
 
-// ✅ anti-duplicação callback vs stream (por slot)
 const STREAM_SUPPRESS_AFTER_FINAL_MS = 4500;
 const __mt_lastFinal = {
   positivo: { ts: 0, hash: "" },
@@ -1113,6 +1137,7 @@ function __mt_noteFinal(slot, text) {
   slot = sugSlotNorm(slot);
   __mt_lastFinal[slot] = { ts: Date.now(), hash: __mt_normHash(text) };
 }
+
 function __mt_shouldSuppressSlotStream(slot) {
   slot = sugSlotNorm(slot);
   const lf = __mt_lastFinal[slot] || {};
@@ -1122,18 +1147,17 @@ function __mt_shouldSuppressSlotStream(slot) {
 function __mt_armIgnoreStream(ms = 3500) {
   __mt_ignoreStreamUntil = Date.now() + Math.max(250, ms | 0);
 }
+
 function __mt_shouldIgnoreStream() {
   return Date.now() < __mt_ignoreStreamUntil;
 }
 
-// ✅ NOVO: quando inicia uma nova geração, limpa guardas (senão bloqueia stream legítimo)
 function __mt_clearStreamGuards() {
   __mt_ignoreStreamUntil = 0;
   __mt_lastFinal.positivo = { ts: 0, hash: "" };
   __mt_lastFinal.negativo = { ts: 0, hash: "" };
 }
 
-// ✅ define final (preferindo finalizar live existente)
 function __mt_sugSetFinal(slot, text) {
   slot = sugSlotNorm(slot);
   const t = String(text || "").trim();
@@ -1141,17 +1165,16 @@ function __mt_sugSetFinal(slot, text) {
 
   if (sugState[slot].liveId) {
     sugUpdateLive(slot, t);
-    sugFinalizeLive(slot); // abre a mais nova
+    sugFinalizeLive(slot);
   } else {
-    sugAddFinal(slot, t); // abre a mais nova
+    sugAddFinal(slot, t);
   }
-
   __mt_noteFinal(slot, t);
 }
 
 // =====================================================
 // ✅ Painel SEMPRE mostra "Autor: mensagem"
-// + ✅ FIX NOVO: Teams no display passa por collapseTeamsRepeats (reduz “acúmulo”)
+// + ✅ FIX NOVO: Teams no display passa por collapseTeamsRepeats
 // =====================================================
 function displayLineAuthorAndText(line) {
   const raw = String(line || "").trim();
@@ -1166,7 +1189,6 @@ function displayLineAuthorAndText(line) {
     if (String(p.origin || "").trim().toLowerCase() === "teams") {
       tx = collapseTeamsRepeats(tx);
     }
-
     return `${sp}: ${tx}`;
   }
 
@@ -1186,8 +1208,10 @@ function displayLineAuthorAndText(line) {
 function splitTeamsInlineTurns(raw) {
   const s = normalizeSpacesOneLine(raw);
   if (!/Teams\s*[•·-]/i.test(s) || s.indexOf(":") < 0) return null;
+
   const re =
     /Teams\s*[•·-]\s*([^:]{1,80}?)\s*:\s*([\s\S]*?)(?=\s*Teams\s*[•·-]\s*[^:]{1,80}?\s*:|$)/gi;
+
   const out = [];
   let m;
   while ((m = re.exec(s)) !== null) {
@@ -1204,7 +1228,9 @@ function formatBlockForPanel(raw) {
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+
   if (!lines.length) return "";
+
   const out = [];
   for (const ln of lines) {
     const turns = splitTeamsInlineTurns(ln);
@@ -1229,11 +1255,10 @@ function setTextPreserveScroll(el, text) {
   el.textContent = text || "";
   if (nearBottom) el.scrollTop = el.scrollHeight;
 }
+
 function setFixedBlock(raw) {
-  // ✅ evita “acúmulo” por repetição no texto final (principalmente Teams)
   const fmt = formatBlockForPanel(String(raw || "").trim());
   panelFixedBlockCache = tail(fmt, 12000);
-
   const el = document.getElementById(UI_IDS.panelFixedBlock);
   if (!el) return;
   setTextPreserveScroll(el, panelFixedBlockCache ? panelFixedBlockCache : "(vazio)");
@@ -1247,12 +1272,15 @@ function setPanelTranscriptText(raw) {
   rebuildPanelLineSetFromCache();
   renderTranscriptListFromCache();
 }
+
 function appendPanelTranscriptLine(line) {
   const ln = String(line || "").trim();
   if (!ln) return;
   if (transcriptCacheHasLine(ln)) return;
+
   panelTranscriptCache = (panelTranscriptCache ? panelTranscriptCache + "\n" : "") + ln;
   panelTranscriptCache = tail(panelTranscriptCache, PANEL_HISTORY_MAX_CHARS);
+
   rebuildPanelLineSetFromCache();
   renderTranscriptListFromCache();
 }
@@ -1260,6 +1288,7 @@ function appendPanelTranscriptLine(line) {
 function isPanelOpen() {
   return document.documentElement.classList.contains("__mt_panel_open");
 }
+
 function withPanelTranscriptScrollPreserved(fn) {
   const host = document.getElementById(UI_IDS.panelTranscript);
   if (!host) return fn();
@@ -1278,20 +1307,25 @@ let teamsRttTimerId = null;
 function teamsRttKey(origin, speaker) {
   return `${String(origin || "").trim()}::${String(speaker || "").trim()}`;
 }
+
 function startTeamsRttTimerIfNeeded() {
   if (teamsRttTimerId) return;
   teamsRttTimerId = setInterval(commitTeamsRttIfReady, TEAMS_RTT_COMMIT_CHECK_MS);
 }
+
 function stopTeamsRttTimerIfIdle() {
   if (teamsRttTimerId && teamsRttBuf.size === 0) {
     clearInterval(teamsRttTimerId);
     teamsRttTimerId = null;
   }
 }
+
 function noteTeamsRtt(speaker, text) {
   const origin = "Teams";
+
   speaker = normalizeSpacesOneLine(speaker || UNKNOWN_SPEAKER_LABEL);
   speaker = guessSpeakerIfUnknown(speaker);
+
   if (!CAPTURE_SELF_LINES && isMe(speaker)) return;
 
   let msg = normalizeSpacesOneLine(cleanCaptionText(text));
@@ -1306,8 +1340,8 @@ function noteTeamsRtt(speaker, text) {
 
   const k = teamsRttKey(origin, speaker);
   const now = Date.now();
-
   const cur = teamsRttBuf.get(k);
+
   if (cur && cur.text === trimmed) {
     cur.lastUpdateAt = now;
     teamsRttBuf.set(k, cur);
@@ -1337,6 +1371,7 @@ function commitTeamsRttIfReady() {
     const finalNow = hasFinalPunct(text);
 
     if (!finalNow && idleFor < TEAMS_RTT_IDLE_COMMIT_MS) continue;
+
     if (!finalNow && text.length < TEAMS_RTT_MIN_CHARS) {
       teamsRttBuf.delete(k);
       continue;
@@ -1371,21 +1406,25 @@ function cancelAutoIaTimer() {
     autoIaTimerId = null;
   }
 }
+
 function pauseAutoIa(ms = 3000) {
   autoIaPauseUntil = Date.now() + Math.max(0, ms | 0);
   cancelAutoIaTimer();
 }
+
 function suppressAutoIaForPayload(payloadStr) {
   const s = String(payloadStr || "").trim();
   if (!s) return;
   lastAutoIaSourceHash = fastHash(s);
 }
+
 function getTailLinesForAutoIa(maxLines = AUTO_IA_MAX_LINES) {
   const lines = String(panelTranscriptCache || "")
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean)
     .filter((l) => !isInternalInjectedLine(l));
+
   if (!lines.length) return [];
   return lines.slice(-Math.max(1, maxLines));
 }
@@ -1457,16 +1496,17 @@ function mergeRunsBySpeaker(lines) {
 
     const origin = String(p.origin || "").trim() || "Teams";
     const speaker = String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL;
+
     let text = normalizeSpacesOneLine(p.text || "");
     if (!text) continue;
 
-    // ✅ reduz “acúmulo” no seed
     if (origin.toLowerCase() === "teams") text = collapseTeamsRepeats(text);
 
     if (cur && cur.origin === origin && cur.speaker === speaker) {
       cur.text = joinWithSpace(cur.text, text);
       continue;
     }
+
     if (cur) out.push(cur);
     cur = { origin, speaker, text };
   }
@@ -1481,9 +1521,34 @@ function mergeForRewrite(lines) {
 }
 
 function __mt_pickLastBlock(mergedLines) {
-  const arr = (Array.isArray(mergedLines) ? mergedLines : []).map((s) => String(s || "").trim()).filter(Boolean);
+  const arr = (Array.isArray(mergedLines) ? mergedLines : [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
   if (!arr.length) return "";
   return arr[arr.length - 1]; // ✅ só o último bloco
+}
+
+// =====================================================
+// ✅ SEED do "Bloco consolidado (merge)"
+// - Mostra SÓ o último bloco
+// - Faz merge APENAS de pipocos (tokens/pontuação/deltas curtos)
+// - NUNCA cola frases inteiras só porque é o mesmo autor
+// - Merge sempre respeita origin + speaker (mesmo autor)
+// =====================================================
+function buildLastBlockSeedFromLines(rawLines) {
+  const raw = Array.isArray(rawLines) ? rawLines : [];
+  if (!raw.length) return "";
+
+  // ✅ só junta pipocos (não junta runs completos do mesmo speaker)
+  const pipMerged = mergePipocadas(raw);
+
+  // ✅ último bloco apenas
+  return __mt_pickLastBlock(pipMerged);
+}
+
+function buildLastBlockSeedFromTail(maxLines = AUTO_IA_MAX_LINES) {
+  const rawLines = getTailLinesForAutoIa(maxLines);
+  return buildLastBlockSeedFromLines(rawLines);
 }
 
 function buildReplySeedFromTail(maxLines = AUTO_IA_MAX_LINES) {
@@ -1575,8 +1640,8 @@ function renderTranscriptListFromCache() {
 
       const txt = document.createElement("div");
       txt.className = "mt-line-text";
-
       const display = displayLineAuthorAndText(line);
+
       if (fixed) {
         const badge = document.createElement("span");
         badge.className = "mt-flag";
@@ -1707,7 +1772,6 @@ function extractTaggedLines(rewritten, expectedCount) {
 
   const map = new Array(expectedCount).fill(null);
   const re = /⟦L(\d{2})⟧\s*([\s\S]*?)(?=⟦L\d{2}⟧|$)/gu;
-
   let m;
   while ((m = re.exec(raw)) !== null) {
     const idx = parseInt(m[1], 10) - 1;
@@ -1719,10 +1783,11 @@ function extractTaggedLines(rewritten, expectedCount) {
 }
 
 function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOrText) {
-  const rawSeg = (rawSegmentLines || []).map((s) => String(s || "").trim()).filter(Boolean);
+  const rawSeg = (rawSegmentLines || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
   if (!rawSeg.length) return null;
 
-  // fonte da verdade p/ origin + speaker
   const rawP = rawSeg.map((ln) => {
     const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
     const p = parseTranscriptLine(probe);
@@ -1740,11 +1805,9 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
   let outLines = Array.isArray(rewrittenLinesOrText)
     ? rewrittenLinesOrText
     : String(rewrittenLinesOrText || "").split("\n");
-
   outLines = outLines.map((s) => String(s || "").trim()).filter(Boolean);
   if (!outLines.length) return null;
 
-  // expande inline-turns
   const expanded = [];
   for (const ln of outLines) {
     const turns = splitTeamsInlineTurns(ln);
@@ -1762,6 +1825,7 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
   for (let i = 0; i < rawP.length; i++) {
     const src = rawP[i];
     const ln = outLines[i];
+
     const probe = ln.startsWith("🎤") ? ln : `🎤 ${ln}`;
     const p = parseTranscriptLine(probe);
 
@@ -1774,7 +1838,6 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
 
     newText = normalizeSpacesOneLine(newText);
 
-    // se veio “Teams • ...” dentro do texto, aborta (colagem)
     if (/Teams\s*[•·-]/i.test(newText)) return null;
 
     if (!newText) newText = src.text || "";
@@ -1790,7 +1853,6 @@ function buildSafeRewriteLinesPreserveSpeakers(rawSegmentLines, rewrittenLinesOr
 function findSegmentIndex(lines, segmentLines) {
   if (!lines?.length || !segmentLines?.length) return -1;
   const n = segmentLines.length;
-
   outer: for (let i = lines.length - n; i >= 0; i--) {
     for (let j = 0; j < n; j++) {
       if (lines[i + j] !== segmentLines[j]) continue outer;
@@ -1813,7 +1875,11 @@ function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
   const idxP = findSegmentIndex(panelLines, rawSeg);
   if (idxP < 0) return false;
 
-  const nextPanel = panelLines.slice(0, idxP).concat(newWithMic).concat(panelLines.slice(idxP + rawSeg.length));
+  const nextPanel = panelLines
+    .slice(0, idxP)
+    .concat(newWithMic)
+    .concat(panelLines.slice(idxP + rawSeg.length));
+
   panelTranscriptCache = tail(nextPanel.join("\n") + "\n", PANEL_HISTORY_MAX_CHARS);
   rebuildPanelLineSetFromCache();
   renderTranscriptListFromCache();
@@ -1826,7 +1892,10 @@ function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
 
   const idxF = findSegmentIndex(fullLines, rawSeg);
   if (idxF >= 0) {
-    const nextFull = fullLines.slice(0, idxF).concat(newWithMic).concat(fullLines.slice(idxF + rawSeg.length));
+    const nextFull = fullLines
+      .slice(0, idxF)
+      .concat(newWithMic)
+      .concat(fullLines.slice(idxF + rawSeg.length));
     transcriptData = nextFull.join("\n") + "\n";
     trimHistoryIfNeeded();
   }
@@ -1852,7 +1921,9 @@ function replaceSegmentInCaches(rawSeg, newWithMic, opts = {}) {
 // ✅ Merge-before-rewrite: aplica merge no histórico (mantido)
 // =====================================================
 function prepareSegmentForRewrite(rawSegmentLines) {
-  const rawSeg = (rawSegmentLines || []).map((s) => String(s || "").trim()).filter(Boolean);
+  const rawSeg = (rawSegmentLines || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
   if (!rawSeg.length) return null;
 
   const mergedNoMic = mergeForRewrite(rawSeg);
@@ -1881,8 +1952,13 @@ function prepareSegmentForRewrite(rawSegmentLines) {
 }
 
 function applyRewriteToSegment(rawSegmentLines, rewrittenLines) {
-  const rawSeg = (rawSegmentLines || []).map((s) => String(s || "").trim()).filter(Boolean);
-  const newSeg = (rewrittenLines || []).map((s) => String(s || "").trim()).filter(Boolean);
+  const rawSeg = (rawSegmentLines || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+  const newSeg = (rewrittenLines || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+
   if (!rawSeg.length || !newSeg.length) return false;
 
   const newWithMic = newSeg.map((s) => (s.startsWith("🎤") ? s : `🎤 ${s}`));
@@ -1980,12 +2056,9 @@ function isGenerateRepliesAck(res) {
   );
 }
 
-// ✅ inicia “sessão” de resposta (não sobrescreve; cria live item novo por slot)
 function sugBeginGeneration(routes = ["positivo", "negativo"]) {
   const uniq = new Set((routes || []).map((r) => sugSlotNorm(r)));
-  for (const slot of uniq) {
-    sugStartLive(slot); // respeita openId (não fecha leitura)
-  }
+  for (const slot of uniq) sugStartLive(slot);
 }
 
 function requestRepliesForText(text, originLabel = "context") {
@@ -2008,22 +2081,13 @@ function requestRepliesForText(text, originLabel = "context") {
     return;
   }
 
-  // ✅ NOVO: limpa guardas de stream (senão bloqueia streaming legítimo no “próximo” request)
   __mt_clearStreamGuards();
-
-  // ✅ NOVO: cria cards live novos (não sobrescreve histórico)
   sugBeginGeneration(["positivo", "negativo"]);
 
   setLauncherState("busy");
+
   safeSendMessage(
-    {
-      action: "generateReplies",
-      payload: {
-        text: payload,
-        routes: ["positivo", "negativo"],
-        origin: originLabel,
-      },
-    },
+    { action: "generateReplies", payload: { text: payload, routes: ["positivo", "negativo"], origin: originLabel } },
     (res) => {
       const le = chrome.runtime?.lastError?.message;
       if (le) {
@@ -2062,12 +2126,10 @@ function requestRepliesForText(text, originLabel = "context") {
       }
 
       console.warn("[MT] generateReplies res inesperada:", res);
-
       if (ENABLE_TWO_CALL_FALLBACK) {
         finishReplyLock();
         return fallbackTwoSuggestions(clean);
       }
-
       setPanelStatus("Erro: resposta inesperada do background.");
       setLauncherState("error");
       finishReplyLock();
@@ -2078,7 +2140,6 @@ function requestRepliesForText(text, originLabel = "context") {
     setPanelStatus("Fallback (2 chamadas)...");
     setLauncherState("busy");
     setAllSuggestionSlots("");
-
     __mt_clearStreamGuards();
 
     // positivo
@@ -2096,7 +2157,6 @@ function requestRepliesForText(text, originLabel = "context") {
         finishReplyLock();
         return;
       }
-
       __mt_sugSetFinal("positivo", String(r1?.suggestion || "").trim());
 
       // negativo
@@ -2114,7 +2174,6 @@ function requestRepliesForText(text, originLabel = "context") {
           finishReplyLock();
           return;
         }
-
         __mt_sugSetFinal("negativo", String(r2?.suggestion || "").trim());
         setPanelStatus("Respostas prontas ✅");
         setLauncherState("ok");
@@ -2127,7 +2186,7 @@ function requestRepliesForText(text, originLabel = "context") {
 // =====================================================
 // ✅ Auto IA: start
 // - Se correção OFF: só faz MERGE local no seed + mostra no bloco + replies
-// - Se correção ON: tenta autoFixUntilClean e depois replies
+// - Se correção ON: tenta autoFixUntilClean e depois responde com o ÚLTIMO bloco
 // =====================================================
 function startAutoIaFromTail(opts = {}) {
   if (!aiAllowedHere()) return;
@@ -2139,8 +2198,8 @@ function startAutoIaFromTail(opts = {}) {
   const rawLines = getTailLinesForAutoIa(AUTO_IA_MAX_LINES);
   if (!rawLines.length) return;
 
-  const mergedLines = mergeForRewrite(rawLines);
-  const seed = __mt_pickLastBlock(mergedLines);
+  // ✅ FIX: "Bloco consolidado" = último bloco + merge só de pipoco (mesmo autor)
+  const seed = buildLastBlockSeedFromLines(rawLines);
   if (!seed) return;
 
   const sourceHash = fastHash(seed);
@@ -2151,37 +2210,47 @@ function startAutoIaFromTail(opts = {}) {
   setAllSuggestionSlots("");
   setLauncherState("busy");
 
+  // =====================================================
+  // ✅ Correção OFF: só consolidar (merge) e responder
+  // =====================================================
   if (!correctionEnabled) {
     setPanelStatus(opts.auto ? "Auto IA: consolidando (merge)..." : "Consolidando (merge)...");
     suppressAutoIaForPayload(seed);
-    const label = opts.auto ? "auto_tail_merge" : "manual_tail_merge";
+
+    const label = opts.auto ? "auto_last_block_merge" : "manual_last_block_merge";
     setPanelStatus(opts.auto ? "Auto IA (streaming)..." : "Gerando (streaming)...");
     requestRepliesForText(seed, label);
     return;
   }
 
+  // =====================================================
+  // ✅ Correção ON: tenta auto-fix (Teams) e depois responde com o ÚLTIMO bloco
+  // =====================================================
   setPanelStatus(opts.auto ? "Auto IA: corrigindo (IA)..." : "Corrigindo (IA)...");
 
   autoFixUntilClean(opts, (r) => {
     const didAny = !!r?.didAny;
     const remaining = !!r?.remaining;
-    const seed2 = buildReplySeedFromTail(AUTO_IA_MAX_LINES) || seed;
+
+    // ✅ após correção, ainda assim o seed é o ÚLTIMO bloco (com merge pipoco)
+    const seed2 = buildLastBlockSeedFromTail(AUTO_IA_MAX_LINES) || seed;
 
     setFixedBlock(seed2);
     suppressAutoIaForPayload(seed2);
+
     setPanelStatus(opts.auto ? "Auto IA (streaming)..." : "Gerando (streaming)...");
 
     const label = opts.auto
       ? didAny
         ? remaining
-          ? "auto_tail_rewrite_partial"
-          : "auto_tail_rewrite"
-        : "auto_tail"
+          ? "auto_last_block_rewrite_partial"
+          : "auto_last_block_rewrite"
+        : "auto_last_block"
       : didAny
-      ? remaining
-        ? "manual_tail_rewrite_partial"
-        : "manual_tail_rewrite"
-      : "manual_tail";
+        ? remaining
+          ? "manual_last_block_rewrite_partial"
+          : "manual_last_block_rewrite"
+        : "manual_last_block";
 
     requestRepliesForText(seed2, label);
   });
@@ -2189,13 +2258,13 @@ function startAutoIaFromTail(opts = {}) {
 
 // =====================================================
 // ✅ clique no “Responder (2)”
-// - Correção OFF: usa seed mergeado do tail
-// - Correção ON: mantém comportamento (corrigir se necessário)
 // =====================================================
 function rewriteSegmentUntilApplied(rawSegLines, triesLeft, cb) {
   if (!correctionEnabled) return cb(false);
 
-  const rawSeg = (rawSegLines || []).map((s) => String(s || "").trim()).filter(Boolean);
+  const rawSeg = (rawSegLines || [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
   if (!rawSeg.length) return cb(false);
 
   const prep = prepareSegmentForRewrite(rawSeg);
@@ -2221,9 +2290,7 @@ function rewriteSegmentUntilApplied(rawSegLines, triesLeft, cb) {
 }
 
 function __mt_getCurrentLineSeed(originalLine) {
-  const probe = String(originalLine || "").trim().startsWith("🎤")
-    ? String(originalLine).trim()
-    : `🎤 ${String(originalLine || "").trim()}`;
+  const probe = String(originalLine || "").trim().startsWith("🎤") ? String(originalLine).trim() : `🎤 ${String(originalLine || "").trim()}`;
   const p = parseTranscriptLine(probe);
   const origin = String(p.origin || "").trim() || "Teams";
   const speaker = String(p.speaker || "").trim() || UNKNOWN_SPEAKER_LABEL;
@@ -2312,6 +2379,7 @@ function openViewerTab() {
     }
   });
 }
+
 function openViewerSidePanel() {
   safeSendMessage({ action: "openViewerSidePanel" }, (res) => {
     if (chrome.runtime?.lastError) {
@@ -2360,7 +2428,6 @@ function ensurePanelUI() {
         <div class="mt-fixed-title">Bloco consolidado (merge)</div>
         <button id="${UI_IDS.panelFixedCopy}" class="mt-mini-btn" type="button">Copiar</button>
       </div>
-
       <div id="${UI_IDS.panelFixedBlock}" class="mt-fixed-box">(vazio)</div>
 
       <div class="mt-sug-head" style="margin-top:10px;">
@@ -2405,16 +2472,17 @@ function ensurePanelUI() {
   panel.querySelector(`#${UI_IDS.panelSugCopyPos}`)?.addEventListener("click", () => {
     copyToClipboard(sugSelectedText("positivo"));
   });
+
   panel.querySelector(`#${UI_IDS.panelSugCopyNeg}`)?.addEventListener("click", () => {
     copyToClipboard(sugSelectedText("negativo"));
   });
+
   panel.querySelector(`#${UI_IDS.panelFixedCopy}`)?.addEventListener("click", () => {
     copyToClipboard(panelFixedBlockCache);
   });
 
   updateCorrectionBtn();
   setPanelTranscriptText(transcriptData ? tail(transcriptData, PANEL_HISTORY_MAX_CHARS) : "");
-
   sugRender("positivo");
   sugRender("negativo");
   setFixedBlock(panelFixedBlockCache);
@@ -2446,10 +2514,12 @@ function refreshPanel() {
       setPanelStatus("Erro ao buscar estado: " + chrome.runtime.lastError.message);
       return;
     }
+
     const payload = res?.payload || null;
     const bgHistory = String(payload?.fullHistory || "").trim();
     const localHistory = String(transcriptData || "").trim();
     const bestHistory = bgHistory.length >= localHistory.length ? bgHistory : localHistory;
+
     setPanelTranscriptText(bestHistory ? tail(bestHistory, PANEL_HISTORY_MAX_CHARS) : "");
   });
 }
@@ -2467,6 +2537,7 @@ function applyDim(enabled) {
     localStorage.setItem("__mt_dim_enabled", dimEnabled ? "1" : "0");
   } catch {}
 }
+
 function toggleDim() {
   applyDim(!dimEnabled);
 }
@@ -2497,7 +2568,6 @@ function injectLauncherUI() {
 
   const style = document.createElement("style");
   style.id = UI_IDS.style;
-
   style.textContent = `
     #${UI_IDS.overlay}{position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:2147483646;display:none;pointer-events:none}
     #${UI_IDS.overlay}.active{display:block}
@@ -2507,24 +2577,19 @@ function injectLauncherUI() {
     #${UI_IDS.bubble}.error .dot{background:#e74c3c;box-shadow:0 0 0 4px rgba(231,76,60,0.18);animation:none}
     #${UI_IDS.bubble}:hover{transform:translateY(-1px)}
     @keyframes __mt_pulse{0%{transform:scale(1)}50%{transform:scale(1.25)}100%{transform:scale(1)}}
-
     :root{--mt_panel_w:min(25vw,520px)}
     #${UI_IDS.panel}{position:fixed;top:0;right:0;width:var(--mt_panel_w);min-width:360px;height:100vh;z-index:2147483645;background:rgba(16,16,18,0.97);color:#fff;border-left:1px solid rgba(255,255,255,0.08);box-shadow:-18px 0 40px rgba(0,0,0,0.35);transform:translateX(100%);transition:transform 160ms ease-out;pointer-events:auto;display:flex;flex-direction:column;font:12px/1.35 Arial,sans-serif}
     :root.__mt_panel_open #${UI_IDS.panel}{transform:translateX(0)}
     :root.__mt_panel_open body{margin-right:var(--mt_panel_w);overflow-x:hidden}
-
     #${UI_IDS.panelHeader}{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;border-bottom:1px solid rgba(255,255,255,0.08)}
     #${UI_IDS.panelHeader} .title{font-weight:900;letter-spacing:.4px}
     #${UI_IDS.panelHeader} .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
     #${UI_IDS.panelHeader} button{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:800 11px/1 Arial,sans-serif;white-space:nowrap}
     #${UI_IDS.panelHeader} button:hover{background:rgba(255,255,255,0.16)}
-
     #${UI_IDS.panelStatus}{padding:8px 10px;color:rgba(255,255,255,0.75);border-bottom:1px solid rgba(255,255,255,0.06);font-size:11px}
-
     #${UI_IDS.panelTranscript}{padding:10px;overflow:auto;flex:1;border-bottom:1px solid rgba(255,255,255,0.06)}
     .mt-transcript-title{font-weight:900;margin-bottom:8px;color:rgba(255,255,255,0.85)}
     .mt-transcript-list{display:flex;flex-direction:column;gap:6px}
-
     .mt-line{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:8px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;background:rgba(255,255,255,0.04)}
     .mt-line:hover{background:rgba(255,255,255,0.06)}
     .mt-line.fixed{border-color:rgba(46,204,113,0.55);background:rgba(46,204,113,0.10)}
@@ -2532,17 +2597,14 @@ function injectLauncherUI() {
     .mt-flag{display:inline-block;margin-right:6px;font-weight:900}
     .mt-line-btn{flex:none;background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35);border-radius:10px;padding:6px 10px;color:#fff;cursor:pointer;font-weight:900;font-size:11px;line-height:1;white-space:nowrap}
     .mt-line-btn:hover{background:rgba(46,204,113,0.24)}
-
     #${UI_IDS.panelSuggestionsWrap}{padding:10px;overflow:auto;flex:1}
     .mt-fixed-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
     .mt-fixed-title{font-weight:900;color:rgba(255,255,255,0.92)}
     .mt-fixed-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin-bottom:8px}
-
     .mt-mini-btn{background:rgba(255,255,255,0.10);color:#fff;border:1px solid rgba(255,255,255,0.14);border-radius:10px;padding:6px 10px;cursor:pointer;font:900 11px/1 Arial,sans-serif;white-space:nowrap}
     .mt-mini-btn:hover{background:rgba(255,255,255,0.16)}
     .mt-mini-btn.ok{background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.35)}
     .mt-mini-btn.ok:hover{background:rgba(46,204,113,0.24)}
-
     .mt-sug-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px}
     .mt-sug-title{font-weight:900;color:rgba(255,255,255,0.92)}
     .mt-sug-grid{display:grid;grid-template-columns:1fr;gap:10px}
@@ -2550,8 +2612,6 @@ function injectLauncherUI() {
     .mt-sug-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
     .mt-sug-card-title{font-weight:900;opacity:.95}
     .mt-sug-box{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:10px;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word}
-
-    /* Collapsible + chevron */
     .mt-hist-empty{opacity:.7;padding:6px 2px}
     .mt-hist-wrap{display:flex;flex-direction:column;gap:8px}
     details.mt-hist-item{border:1px solid rgba(255,255,255,0.10);border-radius:12px;background:rgba(255,255,255,0.03);overflow:hidden}
@@ -2568,7 +2628,6 @@ function injectLauncherUI() {
     .mt-hist-ts{font-size:11px}
     .mt-hist-body{padding:10px;border-top:1px solid rgba(255,255,255,0.08);white-space:pre-wrap;word-break:break-word}
   `;
-
   document.documentElement.appendChild(style);
 
   const overlay = document.createElement("div");
@@ -2577,8 +2636,7 @@ function injectLauncherUI() {
 
   const bubble = document.createElement("div");
   bubble.id = UI_IDS.bubble;
-  bubble.title =
-    "Clique: abrir/fechar painel | Alt+Clique: viewer em nova aba | Ctrl+Clique: Side Panel | Shift+Clique: Dim on/off | Botão direito: Dim on/off";
+  bubble.title = "Clique: abrir/fechar painel | Alt+Clique: viewer em nova aba | Ctrl+Clique: Side Panel | Shift+Clique: Dim on/off | Botão direito: Dim on/off";
   bubble.innerHTML = `MT<div class="dot"></div>`;
   document.documentElement.appendChild(bubble);
 
@@ -2593,6 +2651,7 @@ function injectLauncherUI() {
     if (ev.ctrlKey) return openViewerSidePanel();
     togglePanel();
   });
+
   bubble.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
     toggleDim();
@@ -2620,18 +2679,14 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   }
 
   if (req?.action === "suggestionChunk") {
-    // ✅ compat: se acabamos de receber finais via callback, pode ignorar tudo por um curto período
     if (__mt_shouldIgnoreStream()) return;
     if (!aiAllowedHere()) return;
 
     const slot = req?.slot === "negativo" ? "negativo" : "positivo";
-
-    // ✅ por-slot: se já finalizei via callback recentemente, ignora stream/reset atrasado desse slot
     if (__mt_shouldSuppressSlotStream(slot)) return;
 
     bumpReplyLock(STREAM_LOCK_BUMP_MS);
 
-    // ✅ reset -> inicia live (não sobrescreve histórico; preserva openId)
     if (req.reset) {
       if (!sugState[slot].liveId) sugStartLive(slot);
     }
@@ -2643,7 +2698,6 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
 
     const isFinal = req.done === true || req.final === true || req.isFinal === true;
     if (isFinal) {
-      // tenta capturar o texto final do live antes de limpar
       let finalText = "";
       try {
         const st = sugState[slot];
@@ -2651,9 +2705,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         finalText = String(it?.text || txt || "").trim();
       } catch {}
 
-      sugFinalizeLive(slot); // ✅ abre a mais nova e fecha a anterior
-
-      // marca como final recente -> bloqueia “stream reset” tardio
+      sugFinalizeLive(slot);
       if (finalText) __mt_noteFinal(slot, finalText);
 
       finishReplyLock();
@@ -2689,12 +2741,14 @@ function appendOncePerNode(node, speaker, text, origin) {
   const sp = normalizeSpacesOneLine(speaker || "");
   const tx = normalizeSpacesOneLine(text || "");
   if (!tx) return;
+
   const sig = `${sp}||${tx}`;
   if (node) {
     const prev = _nodeLastCaptured.get(node);
     if (prev === sig) return;
     _nodeLastCaptured.set(node, sig);
   }
+
   appendNewTranscript(sp, tx, origin);
 }
 
@@ -2704,6 +2758,7 @@ function appendOncePerNode(node, speaker, text, origin) {
 function cleanCaptionText(t) {
   const s = String(t || "").replace(/\u00A0/g, " ").trim();
   if (!s) return "";
+
   if (/^\s*RTT\b/i.test(s)) return "";
   if (/Pol[ií]tica de Privacidade/i.test(s)) return "";
   if (/Digite uma mensagem/i.test(s)) return "";
@@ -2712,11 +2767,14 @@ function cleanCaptionText(t) {
   if (/Digita(ç|c)ão\s*RTT/i.test(s)) return "";
   if (/texto\s+em\s+tempo\s+real/i.test(s)) return "";
   if (/real[-\s]*time\s+text/i.test(s)) return "";
+
   return s;
 }
+
 function isJunkCaptionText(s) {
   s = String(s || "");
   if (!s) return true;
+
   if (/^\s*RTT\b/i.test(s)) return true;
   if (/Pol[ií]tica de Privacidade/i.test(s)) return true;
   if (/Digite uma mensagem/i.test(s)) return true;
@@ -2725,11 +2783,14 @@ function isJunkCaptionText(s) {
   if (/Digita(ç|c)ão\s*RTT/i.test(s)) return true;
   if (/texto\s+em\s+tempo\s+real/i.test(s)) return true;
   if (/real[-\s]*time\s+text/i.test(s)) return true;
+
   return false;
 }
+
 function looksLikeInitials(t) {
   return /^[A-Z]{1,3}$/u.test(String(t || "").trim());
 }
+
 function bestLeafText(root) {
   if (!root) return "";
   let best = "";
@@ -2745,6 +2806,7 @@ function bestLeafText(root) {
   }
   return best;
 }
+
 function collectLeafTexts(root) {
   const out = [];
   if (!root) return out;
@@ -2761,6 +2823,7 @@ function collectLeafTexts(root) {
       if (!t) return NodeFilter.FILTER_SKIP;
       if (t.length > 260) return NodeFilter.FILTER_SKIP;
       if (looksLikeInitials(t)) return NodeFilter.FILTER_SKIP;
+
       return NodeFilter.FILTER_ACCEPT;
     },
   });
@@ -2771,6 +2834,7 @@ function collectLeafTexts(root) {
     if (t) out.push(t);
     n = tw.nextNode();
   }
+
   return out.filter(Boolean);
 }
 
@@ -2796,6 +2860,7 @@ function extractMessageFromRoot(root, speaker) {
     seen.add(k);
     uniq.push(t);
   }
+
   texts = uniq.sort((a, b) => b.length - a.length);
 
   const filtered = [];
@@ -2838,21 +2903,19 @@ function isTinyTokenText(t) {
 function joinDeltaText(prevText, delta) {
   prevText = String(prevText || "").trim();
   delta = String(delta || "").trim();
+
   if (!prevText) return delta;
   if (!delta) return prevText;
 
-  // se delta é pontuação, cola sem espaço
   if (/^[.!?…,:;]+$/.test(delta)) return prevText + delta;
 
   const prevLast = prevText.split(" ").filter(Boolean).slice(-1)[0] || "";
   const deltaFirst = delta.split(" ").filter(Boolean)[0] || "";
 
-  // tokens muito pequenos: cola sem espaço (ex: "i" + "n")
   if (isTinyTokenText(prevLast) && isTinyTokenText(deltaFirst) && /^[A-Za-zÀ-ÿ]+$/.test(deltaFirst)) {
     return (prevText + delta).replace(/\s+/g, " ").trim();
   }
 
-  // se prev termina com letra e delta começa com letra -> espaço
   if (/[A-Za-zÀ-ÿ0-9]$/.test(prevText) && /^[A-Za-zÀ-ÿ0-9]/.test(delta)) {
     return (prevText + " " + delta).replace(/\s+/g, " ").trim();
   }
@@ -2877,28 +2940,21 @@ function tryMergeTeamsDeltaIntoLastLine(origin, speaker, deltaText) {
   const delta = String(deltaText || "").trim();
   if (!prevText || !delta) return false;
 
-  // decide se “merece colar”
   const should = delta.length <= TEAMS_PIPOCA_MAX_DELTA_CHARS || (!hasFinalPunct(prevText) && delta.length <= 64);
   if (!should) return false;
 
   let mergedText = joinDeltaText(prevText, delta);
   if (!mergedText) return false;
 
-  // ✅ FIX NOVO: corta repetição aqui também (evita “acúmulo”)
   mergedText = collapseTeamsRepeats(mergedText);
-
   if (mergedText.length > TEAMS_PIPOCA_MAX_LINE_CHARS) return false;
 
   const updatedSingle = `🎤 ${origin}: ${speaker}: ${mergedText}`;
 
-  // troca no histórico/painel
   replaceLastLineInCaches(oldSingle, updatedSingle);
-
   lastSingleLineByKey.set(kOS, updatedSingle);
   lastAppendAtByKey.set(kOS, now);
 
-  // ✅ NÃO manda transcriptTick (isso duplica no background se ele appendar)
-  // Apenas marca atividade e força flush (que envia o fullHistory correto)
   markTranscriptActivity();
   scheduleFlushSoon();
   return true;
@@ -2926,8 +2982,8 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
     }
   }
 
-  // fallback speaker
   speaker = guessSpeakerIfUnknown(speaker);
+
   if (!isUnknownSpeaker(speaker)) {
     noteNonUnknownSpeaker(speaker);
     if (isMe(speaker)) addMyName(speaker);
@@ -2946,14 +3002,12 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
 
   const kOS = `${origin}::${speaker}`;
   const prevLine = lastLineByKey.get(kOS) || "";
-
   let newContent = cleanText;
 
   // delta guard
   if (prevLine && cleanText.startsWith(prevLine)) {
     const remainder = normalizeSpacesOneLine(cleanText.slice(prevLine.length));
 
-    // Teams eco: remainder parece o prevLine -> não reapenda
     if (originLower === "teams") {
       const remK = normTextKey(remainder);
       const prevK = normTextKey(prevLine);
@@ -2962,6 +3016,7 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
         return;
       }
     }
+
     newContent = remainder;
   }
 
@@ -2974,18 +3029,15 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
     if (!oldSingle) return;
     if (oldSingle.trim().endsWith(newContent)) return;
 
-    // ✅ FIX NOVO: evita “acúmulo” por eco no fim
     const pOld = parseTranscriptLine(oldSingle);
     let mergedText = String(pOld.text || "").trim() + String(newContent || "").trim();
     mergedText = collapseTeamsRepeats(mergedText);
 
     const updatedSingle = `🎤 ${origin}: ${speaker}: ${mergedText}`;
-
     replaceLastLineInCaches(oldSingle, updatedSingle);
     lastSingleLineByKey.set(kOS, updatedSingle);
     lastAppendAtByKey.set(kOS, Date.now());
 
-    // ✅ NÃO manda tick em update de linha existente
     markTranscriptActivity();
     scheduleFlushSoon();
     return;
@@ -2995,7 +3047,6 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   if (originLower === "teams") {
     const merged = tryMergeTeamsDeltaIntoLastLine(origin, speaker, newContent);
     if (merged) {
-      // também agrega no latestBySpeaker (p/ flush)
       const previous = latestBySpeaker.get(speaker) || "";
       latestBySpeaker.set(speaker, previous ? `${previous} ${newContent}` : newContent);
       return;
@@ -3011,8 +3062,8 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   // dedupe curto por texto (origin + texto), preferindo speaker conhecido
   const textKey = `${origin}||${normTextKey(newContent)}`;
   const now = Date.now();
-
   const prev = recentText.get(textKey);
+
   if (prev && now - prev.ts < TEXT_DEDUP_MS) {
     const prevUnknown = isUnknownSpeaker(prev.speaker);
     const curUnknown = isUnknownSpeaker(speaker);
@@ -3035,10 +3086,13 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
       trimHistoryIfNeeded();
       lastSingleLineByKey.set(kOS, singleLineNew);
       lastAppendAtByKey.set(kOS, now);
+
       try {
         latestBySpeaker.delete(prev.speaker);
       } catch {}
+
       recentText.set(textKey, { ts: now, speaker, line: singleLineNew });
+
       markTranscriptActivity();
       scheduleFlushSoon();
       return;
@@ -3046,7 +3100,6 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   }
 
   const singleLine = `🎤 ${origin}: ${speaker}: ${newContent}`;
-
   transcriptData += singleLine + "\n";
   trimHistoryIfNeeded();
 
@@ -3062,7 +3115,6 @@ function appendNewTranscript(speaker, fullText, origin, _alreadySplit = false) {
   latestBySpeaker.set(speaker, previous ? `${previous} ${newContent}` : newContent);
 
   safeSendMessage({ action: "transcriptTick", payload: { line: singleLine, timestamp: nowIso() } });
-
   markTranscriptActivity();
   scheduleFlushSoon();
 }
@@ -3123,6 +3175,7 @@ const captureTeamsRTT = () => {
       msg = extractMessageFromRoot(cur, speaker);
       cur = cur.parentElement;
     }
+
     msg = cleanCaptionText(msg);
     if (!msg) continue;
 
@@ -3137,7 +3190,8 @@ const captureTeamsCaptionsV2 = () => {
     document.querySelector('[data-tid="closed-caption-v2-window-wrapper"]');
   if (!wrapper) return;
 
-  const list = wrapper.querySelector('[data-tid="closed-caption-v2-virtual-list-content"]') || wrapper;
+  const list =
+    wrapper.querySelector('[data-tid="closed-caption-v2-virtual-list-content"]') || wrapper;
 
   const authorEls = list.querySelectorAll('span[data-tid="author"]');
   if (authorEls && authorEls.length) {
@@ -3180,6 +3234,7 @@ const captureTeamsCaptionsV2 = () => {
     if (item.querySelector?.('[data-tid="real-time-text-intro-card"]')) continue;
     const rawBest = bestLeafText(item);
     if (!rawBest) continue;
+
     const inline = splitSpeakerInline(rawBest);
     if (!inline) continue;
 
@@ -3203,7 +3258,8 @@ const captureTeams = () => {
 
 const captureSlack = () => {
   document.querySelectorAll(".p-huddle_event_log__base_event").forEach((event) => {
-    const speaker = event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
+    const speaker =
+      event.querySelector(".p-huddle_event_log__member_name")?.innerText?.trim() || UNKNOWN_SPEAKER_LABEL;
     const text = event.querySelector(".p-huddle_event_log__transcription")?.innerText?.trim();
     if (text) appendOncePerNode(event, speaker, text, "Slack");
   });
@@ -3222,8 +3278,10 @@ const captureTranscript = () => {
 if (isSupportedPage() && IS_TOP_FRAME) {
   loadFixedFlags();
   loadCorrectionSetting();
+
   startTimeoutId = setTimeout(() => {
     captureIntervalId = setInterval(captureTranscript, CAPTURE_INTERVAL_MS);
   }, CAPTURE_START_DELAY_MS);
+
   flushIntervalId = setInterval(() => flushNow("interval"), FLUSH_INTERVAL_MS);
 }
