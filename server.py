@@ -9,14 +9,16 @@
 #  - POST /ask           -> streams ONLY 120b corrector
 #  - POST /ask_me        -> CHAIN positive (stage1 -> 120b) ✅ stage1 stream DEFAULT ON
 #  - POST /ask_me_neg    -> CHAIN negative (stage1 -> 120b) ✅ stage1 stream DEFAULT ON
-#  - /health, /context*, /buffer
+#  - /health noting prompt files
 #
-# ✅ FIXES INCLUDED:
-# - Stage1 (8B) greeting/thanks/bye/how-are-you handled deterministically
-# - Stage1 rules: POSITIVE vs NEGATIVE
-# - Stage2 prompts: explicit MOOD + NEVER ask questions / NEVER use '?', no sign-offs
-# - Parser: ignores [stage1]/[stage2] markers + favors explicit "Interviewer:" lines
-# - is_code_like(): stops treating URL/path as code
+# ✅ Prompts fora do código (TXT):
+#  - prompts/stage1_system.txt
+#  - prompts/stage1_rules_positive.txt
+#  - prompts/stage1_rules_negative.txt
+#  - prompts/stage2_profile_positive.txt
+#  - prompts/stage2_profile_negative.txt
+#  - prompts/stage2_corrector.txt
+#  - prompts/stage2_consolidator.txt
 
 import os
 import sys
@@ -29,6 +31,12 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo  # py 3.9+
+except Exception:
+    ZoneInfo = None
 
 # =========================
 # 📦 AUTO-INSTALL (libs)
@@ -85,6 +93,242 @@ STREAM_HEADERS = {
 BASE_DIR = Path(__file__).parent
 INDEX_PATH = BASE_DIR / "index.html"
 
+# =========================
+# 📄 PROMPTS (TXT external)
+# =========================
+PROMPTS_DIR = Path(os.getenv("PROMPTS_DIR", str(BASE_DIR / "prompts")))
+PROMPTS_STRICT = (os.getenv("PROMPTS_STRICT", "true").strip().lower() in ("1", "true", "yes", "y", "on"))
+PROMPTS_AUTO_RELOAD = (os.getenv("PROMPTS_AUTO_RELOAD", "true").strip().lower() in ("1", "true", "yes", "y", "on"))
+
+PROMPT_FILES = {
+    "stage1_system": "stage1_system.txt",
+    "stage1_rules_positive": "stage1_rules_positive.txt",
+    "stage1_rules_negative": "stage1_rules_negative.txt",
+    "stage2_profile_positive": "stage2_profile_positive.txt",
+    "stage2_profile_negative": "stage2_profile_negative.txt",
+    "stage2_corrector": "stage2_corrector.txt",
+    "stage2_consolidator": "stage2_consolidator.txt",
+}
+
+_PROMPT_CACHE = {}  # key -> {"text": str, "mtime": float}
+
+
+def _read_text_file(path: Path) -> str:
+    # strip BOM + trailing whitespace
+    txt = path.read_text(encoding="utf-8", errors="replace")
+    txt = txt.lstrip("\ufeff").strip()
+    return txt
+
+
+def load_prompt(key: str) -> str:
+    if key not in PROMPT_FILES:
+        raise RuntimeError(f"Unknown prompt key: {key}")
+    path = PROMPTS_DIR / PROMPT_FILES[key]
+    if not path.exists():
+        if PROMPTS_STRICT:
+            raise RuntimeError(f"Missing prompt file: {path}")
+        log.warning("[prompts] missing file: %s (returning empty)", path)
+        return ""
+
+    try:
+        mtime = path.stat().st_mtime
+    except Exception:
+        mtime = 0.0
+
+    cached = _PROMPT_CACHE.get(key)
+    if cached and (not PROMPTS_AUTO_RELOAD or cached.get("mtime") == mtime):
+        return cached.get("text", "")
+
+    txt = _read_text_file(path)
+    _PROMPT_CACHE[key] = {"text": txt, "mtime": mtime}
+    return txt
+
+
+def _load_all_prompts_on_startup():
+    # fail-fast se PROMPTS_STRICT=true
+    for k in PROMPT_FILES.keys():
+        _ = load_prompt(k)
+    log.info("[prompts] loaded dir=%s strict=%s auto_reload=%s", PROMPTS_DIR, PROMPTS_STRICT, PROMPTS_AUTO_RELOAD)
+
+
+_load_all_prompts_on_startup()
+
+# =========================
+# 🕒 TIME CONTEXT (runtime)
+# =========================
+def _env_bool(name: str, default: bool) -> bool:
+    v = (os.getenv(name, "") or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "on")
+
+
+TIME_CONTEXT_ENABLED = _env_bool("TIME_CONTEXT_ENABLED", True)
+TIME_CONTEXT_TZ = os.getenv("TIME_CONTEXT_TZ", "America/Sao_Paulo").strip() or "America/Sao_Paulo"
+TIME_CONTEXT_LOCATION = os.getenv("TIME_CONTEXT_LOCATION", "Pelotas, Rio Grande do Sul, Brazil").strip() or "Pelotas, Rio Grande do Sul, Brazil"
+TIME_CONTEXT_INCLUDE_ISO = _env_bool("TIME_CONTEXT_INCLUDE_ISO", True)
+
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+_ORDINAL_1_31 = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+    11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth", 15: "fifteenth", 16: "sixteenth", 17: "seventeenth",
+    18: "eighteenth", 19: "nineteenth", 20: "twentieth", 21: "twenty-first", 22: "twenty-second", 23: "twenty-third",
+    24: "twenty-fourth", 25: "twenty-fifth", 26: "twenty-sixth", 27: "twenty-seventh", 28: "twenty-eighth",
+    29: "twenty-ninth", 30: "thirtieth", 31: "thirty-first",
+}
+
+_UNITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _num_to_words(n: int) -> str:
+    n = int(n)
+    if n < 0:
+        return "minus " + _num_to_words(-n)
+    if n < 20:
+        return _UNITS[n]
+    if n < 100:
+        tens = n // 10
+        rem = n % 10
+        return _TENS[tens] if rem == 0 else f"{_TENS[tens]}-{_UNITS[rem]}"
+    if n < 1000:
+        h = n // 100
+        rem = n % 100
+        return f"{_UNITS[h]} hundred" if rem == 0 else f"{_UNITS[h]} hundred {_num_to_words(rem)}"
+    if n < 10000:
+        th = n // 1000
+        rem = n % 1000
+        head = f"{_UNITS[th]} thousand"
+        return head if rem == 0 else f"{head} {_num_to_words(rem)}"
+    return str(n)
+
+
+def _year_to_words(y: int) -> str:
+    # 2000–2099 friendly: "two thousand twenty-six"
+    y = int(y)
+    if 2000 <= y <= 2099:
+        rem = y - 2000
+        if rem == 0:
+            return "two thousand"
+        if rem < 100:
+            return "two thousand " + _num_to_words(rem)
+    return _num_to_words(y)
+
+
+def _minute_to_words(m: int) -> str:
+    m = int(m)
+    if m == 0:
+        return "o'clock"
+    if m < 10:
+        return "oh " + _num_to_words(m)
+    return _num_to_words(m)
+
+
+def _time_to_words(dt: datetime) -> str:
+    # twelve-hour with am/pm
+    hour = int(dt.hour)
+    minute = int(dt.minute)
+    ampm = "a.m." if hour < 12 else "p.m."
+    h12 = hour % 12
+    if h12 == 0:
+        h12 = 12
+    if minute == 0:
+        return f"{_num_to_words(h12)} o'clock {ampm}"
+    return f"{_num_to_words(h12)} {_minute_to_words(minute)} {ampm}"
+
+
+def _utc_offset_words(dt: datetime) -> str:
+    try:
+        off = dt.utcoffset()
+        if off is None:
+            return "UTC"
+        total_min = int(off.total_seconds() // 60)
+        if total_min == 0:
+            return "UTC plus zero"
+        sign = "plus" if total_min > 0 else "minus"
+        total_min = abs(total_min)
+        hh = total_min // 60
+        mm = total_min % 60
+        if mm == 0:
+            return f"UTC {sign} {_num_to_words(hh)}"
+        return f"UTC {sign} {_num_to_words(hh)} hours {_num_to_words(mm)} minutes"
+    except Exception:
+        return "UTC"
+
+
+def _now_local() -> datetime:
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(TIME_CONTEXT_TZ))
+        except Exception:
+            return datetime.now()
+    return datetime.now()
+
+
+def time_context_line() -> str:
+    if not TIME_CONTEXT_ENABLED:
+        return ""
+    dt = _now_local()
+    weekday = _WEEKDAYS[dt.weekday()]
+    month = _MONTHS[dt.month - 1]
+    day_ord = _ORDINAL_1_31.get(dt.day, _num_to_words(dt.day))
+    year_words = _year_to_words(dt.year)
+    time_words = _time_to_words(dt)
+    offset_words = _utc_offset_words(dt)
+
+    base = (
+        f"Location is {TIME_CONTEXT_LOCATION}. "
+        f"Time zone is {TIME_CONTEXT_TZ}, {offset_words}. "
+        f"Now is {weekday}, {month} {day_ord}, {year_words}, {time_words}."
+    )
+    if TIME_CONTEXT_INCLUDE_ISO:
+        base += f" ISO_8601={dt.isoformat()}."
+    return base.strip()
+
+
+def _with_time(prompt_text: str) -> str:
+    tc = time_context_line()
+    if not tc:
+        return (prompt_text or "").strip()
+    p = (prompt_text or "").strip()
+    return (p + "\n\n" + "TIME CONTEXT: " + tc).strip()
+
+
+# =========================
+# 👤 PROFILE CONTEXT (runtime injection)
+# =========================
+PROFILE_CONTEXT_ENABLED = _env_bool("PROFILE_CONTEXT_ENABLED", True)
+
+PROFILE_CONTEXT_BLOCK = (
+    "PROFILE CONTEXT: I am Brazilian and I am based in Pelotas, Rio Grande do Sul, Brazil. "
+    "I am an integration professional focused on MuleSoft Anypoint Platform, Design Center, RAML, and DataWeave, "
+    "with over five years of hands-on experience delivering API-led integrations and enterprise-grade solutions. "
+    "My background includes consulting and delivery roles across organizations such as Accenture Brasil, Capgemini, IBM, "
+    "Tata Consultancy Services, Compass UOL, SYS4B, Mouts TI, and Gestor SA. "
+    "I am currently not employed and I am available for new opportunities. "
+    "I hold Salesforce certifications including Salesforce Certified Agentforce Specialist, Salesforce Certified Administrator, "
+    "Salesforce Certified Advanced Administrator, Salesforce Certified Platform App Builder, Salesforce Certified Associate, "
+    "Salesforce Certified Marketing Associate, Salesforce Certified JavaScript Developer I, Salesforce Certified MuleSoft Associate, "
+    "Salesforce Certified MuleSoft Developer I, and Salesforce Certified MuleSoft Platform Architect I. "
+    "If asked about compensation, I state around five thousand US dollars per month, unless the user prompt provides a different amount or cadence. "
+    "When responding in English, I write numbers in words in normal prose while preserving standard technical tokens such as OAuth 2.0, HTTP 500, Mule 4, and TLS 1.2."
+).strip()
+
+
+def _with_profile(prompt_text: str) -> str:
+    p = (prompt_text or "").strip()
+    if not PROFILE_CONTEXT_ENABLED:
+        return p
+    if not p:
+        return PROFILE_CONTEXT_BLOCK
+    return (p + "\n\n" + PROFILE_CONTEXT_BLOCK).strip()
+
+
+def _with_profile_and_time(prompt_text: str) -> str:
+    return _with_time(_with_profile(prompt_text))
+
+
 # ---- Stage 1 (llama.cpp /completion)
 LLAMA_DEFAULT_URL = os.getenv("LLAMA_URL", "http://localhost:8080/completion")
 LLAMA_DEFAULT_NPREDICT = int(os.getenv("LLAMA_NPREDICT", "220"))
@@ -97,7 +341,6 @@ LLAMA_DEFAULT_REPEAT_LAST_N = int(os.getenv("LLAMA_REPEAT_LAST_N", "64"))
 LLAMA_DEFAULT_REPEAT_PENALTY = float(os.getenv("LLAMA_REPEAT_PENALTY", "1.0"))
 LLAMA_DEFAULT_PRESENCE_PENALTY = float(os.getenv("LLAMA_PRESENCE_PENALTY", "0.0"))
 LLAMA_DEFAULT_FREQUENCY_PENALTY = float(os.getenv("LLAMA_FREQUENCY_PENALTY", "0.0"))
-
 STAGE1_CONNECT_TIMEOUT = float(os.getenv("STAGE1_CONNECT_TIMEOUT", "5"))
 STAGE1_TIMEOUT = float(os.getenv("STAGE1_TIMEOUT", "120"))
 
@@ -111,20 +354,11 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:120b-cloud")
 TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))
 CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "10"))
-
 MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "20000"))
 MAX_DRAFT_CHARS = int(os.getenv("MAX_DRAFT_CHARS", "6000"))
 
 API_KEY = os.getenv("API_KEY", "").strip()  # optional x-api-key
 FILTER_NOISE = True
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = (os.getenv(name, "") or "").strip().lower()
-    if not v:
-        return default
-    return v in ("1", "true", "yes", "y", "on")
-
 
 # stage1 stream default ON (preview the 8B while 120B prepares)
 STREAM_STAGE1_DEFAULT = _env_bool("STREAM_STAGE1_DEFAULT", True)
@@ -150,84 +384,23 @@ OPTIONS_CORRECTOR = {"temperature": 0.1, "top_p": 0.8, "repeat_penalty": 1.1, "n
 OPTIONS_CONSOLIDATOR = {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.1, "num_ctx": 4096}
 
 # =========================
-# 🧠 SYSTEM PROMPTS (stage 2) — ENGLISH ONLY
+# 🧠 PROMPTS (loaded from txt)
 # =========================
-_SYSTEM_COMMON = [
-    "IDENTITY: You are Leonel Dorneles Porto, answering in first person (I) as a technical interview candidate.",
-    "LANGUAGE: Output must be English only.",
-    "INPUT FORMAT: You receive 'MOOD=...; AUTHOR=<name>; SPEECH=<text>; INSTRUCTION=...; DRAFT=...; CONTEXT=...'.",
-    "AUTHOR RULE: Line one MUST start exactly with '<AUTHOR>, ' (only once).",
-    "AUTHOR RULE: Lines two and onward MUST NOT start with '<AUTHOR>, ' and MUST NOT repeat the author name.",
-    "HARD OUTPUT RULES: Never ask questions and never use '?'.",
-    "HARD OUTPUT RULES: Do not add sign-offs or signatures.",
-    "FORBIDDEN: No bullets, no numbering, no titles.",
-    "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
-    "NO ECHO: Never quote, paste, or restate the input or any code. Do not output prompts or configuration text.",
-    "CONSISTENCY: Do not contradict SPEECH or DRAFT. If DRAFT exists, keep the same meaning and improve clarity.",
-    "CONTEXT: If CONTEXT exists, keep consistency.",
-    "NUMBERS: Prefer numbers in words in prose; keep standard technical tokens as-is (e.g., OAuth 2.0, HTTP 500).",
-    "POSITIONING: Senior integration specialist, expert in MuleSoft Design Center, RAML, DataWeave, and Anypoint Platform.",
-    "FORMAT: If SPEECH is only a greeting/thanks/bye, output ONE short line. Otherwise, produce at least ten lines separated by '\\n'.",
-]
+def get_stage2_profile_prompt(mode: str) -> str:
+    if (mode or "").strip().lower() == "negativo":
+        return _with_profile_and_time(load_prompt("stage2_profile_negative"))
+    return _with_profile_and_time(load_prompt("stage2_profile_positive"))
 
-SYSTEM_PROMPT_PROFILE_POSITIVE = " ".join(
-    [
-        "MOOD: POSITIVE (warm, confident, collaborative).",
-        *_SYSTEM_COMMON,
-    ]
-)
 
-SYSTEM_PROMPT_PROFILE_NEGATIVE = " ".join(
-    [
-        "MOOD: NEGATIVE (firm, objective, sets boundaries; not rude).",
-        *_SYSTEM_COMMON,
-        "TONE: Firm, polite, objective. Refuse or disagree when needed.",
-    ]
-)
-
-SYSTEM_PROMPT_CORRECTOR = " ".join(
-    [
-        "MODE: You are a grammar and spelling corrector.",
-        "TASK: Fix text while preserving meaning, tone, and language; improve punctuation; preserve technical terms and code.",
-        "OUTPUT: Return ONLY the corrected text in a single line, no explanations.",
-        "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
-    ]
-)
-
-SYSTEM_PROMPT_CONSOLIDATOR = " ".join(
-    [
-        "MODE: You consolidate short interview context from clean messages (AUTHOR: TEXT).",
-        "LANGUAGE: Output must be English only.",
-        "TASK: Produce ONE single line with forty to seventy words, no bullets, no titles, no questions, and never use '?'.",
-        "RULES: Preserve technical terms; do not invent metrics.",
-        "NO META: Never mention AI, model, prompts, rules, system, tokens, or configuration.",
-        "NO ECHO: Never paste large chunks of source code; summarize only.",
-    ]
-)
+SYSTEM_PROMPT_CORRECTOR = lambda: _with_time(load_prompt("stage2_corrector"))
+SYSTEM_PROMPT_CONSOLIDATOR = lambda: _with_time(load_prompt("stage2_consolidator"))
 
 # =========================
 # ✅ Stage 1 (llama.cpp) chat template + system
 # =========================
-STAGE1_SYSTEM = """
-You are Leonel Dorneles Porto, an integration professional specialized in MuleSoft (Anypoint Platform), Design Center, RAML, and DataWeave, answering in technical interviews.
-
-MANDATORY RULES:
-- Language: respond ONLY in the language specified by 'IDIOMA:' when it exists.
-- If 'IDIOMA:' is missing, respond in the dominant language of the user's text.
-- Do NOT translate the user's text. Do NOT mix languages.
-- Always use first-person voice ("I").
-- Never mention AI, model, prompts, rules, system, tokens, or configuration.
-- Confidentiality: do not include internal names, IDs, URLs, paths, tokens, keys, or any sensitive data.
-
-FORMAT:
-- Follow EXACTLY the format and limits provided in the user's prompt.
-- If there is any conflict, the user's prompt overrides format/limits.
-
-HARD OUTPUT RULES:
-- Never ask questions and never use '?'.
-- Do not add sign-offs or signatures.
-""".strip()
-
+STAGE1_SYSTEM = lambda: load_prompt("stage1_system")
+STAGE1_RULES_POSITIVE = lambda: load_prompt("stage1_rules_positive")
+STAGE1_RULES_NEGATIVE = lambda: load_prompt("stage1_rules_negative")
 STAGE1_STOP = ["<|eot_id|>"]
 
 
@@ -249,7 +422,7 @@ def strip_prompt_echo(text: str) -> str:
     marker = "<|start_header_id|>assistant<|end_header_id|>"
     i = text.lower().find(marker.lower())
     if i >= 0:
-        return text[i + len(marker) :].strip()
+        return text[i + len(marker):].strip()
     return text.strip()
 
 
@@ -389,7 +562,6 @@ def _stage1_canned(author: str, speech: str, mode: str) -> str:
     a = (author or "Interviewer").strip() or "Interviewer"
     m = (mode or "positivo").strip().lower()
 
-    # HARD RULES: never ask questions / never use '?'
     if _is_greetish_only(speech):
         if lang == "pt":
             return f"{a}, oi! Estou bem, obrigado." if m == "positivo" else f"{a}, oi. Estou bem."
@@ -438,7 +610,6 @@ def is_code_like(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-
     low = t.lower()
 
     # natural language “question-like” should not be considered code
@@ -456,12 +627,10 @@ def is_code_like(text: str) -> bool:
     if _CODE_PREFIX_RE.match(t):
         return True
 
-    # DataWeave / XML / heavy syntax hints
     code_tokens = ["%dw", "<mule", "</", "{", "}", "();", "=>", "==", "!=", "/*", "*/", "BEGIN:VEVENT"]
     if any(tok in t for tok in code_tokens) and len(t) >= 60:
         return True
 
-    # symbol density heuristic (DO NOT count "/" to avoid URL/path false positives)
     symbols = sum(1 for ch in t if ch in "{}[]();=<>$#@\\")
     if len(t) >= 120 and symbols >= 14:
         return True
@@ -496,19 +665,15 @@ def parse_line_author_and_text(line: str):
     p = _parse_teams_inline(s)
     if p:
         return p
-
-    # strongly prefer explicit interviewer lines
     if _INTERVIEWER_PREFIX_RE.match(s):
         _, rest = s.split(":", 1)
         return {"author": "Interviewer", "text": rest.strip(), "raw": s}
-
     parts = [p.strip() for p in s.rsplit(":", 2)]
     if len(parts) == 3:
         _prefix, speaker, msg = parts
         if speaker and msg:
             author = "Interviewer" if speaker.lower() in ("unknown", "desconhecido") else speaker
             return {"author": author, "text": msg, "raw": s}
-
     author, rest = s.split(":", 1)
     author = author.strip()
     text = rest.strip()
@@ -532,7 +697,6 @@ def _is_ignored_line(ln: str) -> bool:
 def extract_last_valid(raw: str):
     raw = raw or ""
 
-    # inline Teams
     p_inline = _parse_teams_inline(raw.strip())
     if p_inline:
         if FILTER_NOISE and is_noise_text(p_inline["text"]):
@@ -545,14 +709,12 @@ def extract_last_valid(raw: str):
     lines_all = [ln.strip() for ln in raw.splitlines() if ln and ln.strip()]
     lines = [ln for ln in lines_all if not _is_ignored_line(ln)]
 
-    # pass 1: prefer explicit "Interviewer:" lines
     for ln in reversed(lines):
         if _INTERVIEWER_PREFIX_RE.match(ln):
             p = parse_line_author_and_text(ln)
             if p and not (FILTER_NOISE and is_noise_text(p["text"])) and not is_code_like(p["text"]):
                 return p
 
-    # pass 2: generic author:text heuristics
     for ln in reversed(lines):
         p = parse_line_author_and_text(ln)
         if not p:
@@ -587,9 +749,11 @@ def build_profile_user_text(raw_prompt: str, draft: str = "", context: str = "",
 
     m = (mode or "positivo").strip().lower()
     mood_tag = "NEGATIVE" if m == "negativo" else "POSITIVE"
+    tc = time_context_line()
 
     out = (
         f"MOOD={mood_tag}; "
+        f"TIME={tc}; "
         f"AUTHOR={author}; "
         f"SPEECH={speech}; "
         f"INSTRUCTION=Answer the AUTHOR. Line one starts with '{author}, ' only once; lines two and onward must not repeat the author name. "
@@ -602,43 +766,7 @@ def build_profile_user_text(raw_prompt: str, draft: str = "", context: str = "",
     return out.strip()
 
 
-# =========================
-# ✅ Stage1 (8B) USER INSTRUCTION — POS/NEG
-# =========================
-STAGE1_RULES_POSITIVE = os.getenv(
-    "STAGE1_RULES_POSITIVE",
-    "RULES (follow exactly): "
-    "Answer SPEECH directly and naturally with a positive, helpful tone. "
-    "Output ONE or TWO short lines separated by \\n (prefer one). "
-    "Keep total under three hundred and twenty characters. "
-    "Use first-person. "
-    "Never ask questions and never use '?'. "
-    "No meta (no AI, model, prompts, rules). "
-    "No echo: do not quote the input. "
-    "No bullets, no numbering, no brackets. "
-    "Do not add sign-offs or signatures. "
-    "If SPEECH is unclear, say you need more context in one short sentence. ",
-).strip()
-
-STAGE1_RULES_NEGATIVE = os.getenv(
-    "STAGE1_RULES_NEGATIVE",
-    "RULES (follow exactly): "
-    "Answer SPEECH directly and naturally with a firm, objective tone. "
-    "If the request is unreasonable, refuse briefly and professionally. "
-    "Output ONE or TWO short lines separated by \\n (prefer one). "
-    "Keep total under three hundred and twenty characters. "
-    "Use first-person. "
-    "Never ask questions and never use '?'. "
-    "No meta (no AI, model, prompts, rules). "
-    "No echo: do not quote the input. "
-    "No bullets, no numbering, no brackets. "
-    "Do not add sign-offs or signatures. "
-    "If SPEECH is unclear, say you need more context in one short sentence. ",
-).strip()
-
-
 def build_stage1_user_text(raw_prompt: str, mode: str) -> Tuple[str, str, str]:
-    """Returns (author, speech, stage1_user_text)."""
     last = extract_last_valid(raw_prompt)
     if not last:
         author = "Interviewer"
@@ -653,8 +781,9 @@ def build_stage1_user_text(raw_prompt: str, mode: str) -> Tuple[str, str, str]:
         speech = "No clear spoken interview question found."
 
     m = (mode or "positivo").strip().lower()
-    rules = STAGE1_RULES_NEGATIVE if m == "negativo" else STAGE1_RULES_POSITIVE
+    rules = STAGE1_RULES_NEGATIVE() if m == "negativo" else STAGE1_RULES_POSITIVE()
     mood_tag = "NEGATIVE" if m == "negativo" else "POSITIVE"
+    tc = time_context_line()
 
     return (
         author,
@@ -664,6 +793,7 @@ def build_stage1_user_text(raw_prompt: str, mode: str) -> Tuple[str, str, str]:
             f"MOOD: {mood_tag}\n"
             f"AUTHOR: {author}\n"
             f"SPEECH: {speech}\n"
+            f"TIME: {tc}\n"
             f"{rules}\n"
             "Answer now:"
         ).strip(),
@@ -674,7 +804,7 @@ def build_stage1_user_text(raw_prompt: str, mode: str) -> Tuple[str, str, str]:
 # 🧠 Context memory
 # =========================
 STATE_LOCK = threading.Lock()
-CLEAN_BUFFER = []  # [{ts, author, text}]
+CLEAN_BUFFER = []
 CONTEXT_TEXT = ""
 LAST_CONTEXT_HASH = ""
 LAST_CONTEXT_AT = 0.0
@@ -726,7 +856,7 @@ def refresh_context_sync():
     if h == current_hash and current_ctx:
         return current_ctx
     ctx = call_ollama_sync(
-        SYSTEM_PROMPT_CONSOLIDATOR,
+        SYSTEM_PROMPT_CONSOLIDATOR(),
         build_consolidator_input(msgs),
         OPTIONS_CONSOLIDATOR,
     )
@@ -778,17 +908,14 @@ def stream_ollama_chat(system_prompt: str, user_text: str, options: dict, saniti
                 msg = json.loads(raw_line)
             except Exception:
                 continue
-
             if msg.get("error"):
                 yield f"[ollama_error] {msg['error']}\n"
                 return
-
             chunk = (msg.get("message") or {}).get("content") or ""
             if chunk:
                 if sanitize_newlines:
                     chunk = chunk.replace("\r", " ").replace("\n", " ")
                 yield chunk
-
             if msg.get("done"):
                 return
 
@@ -803,7 +930,6 @@ def _clean_stage1_text(raw: str) -> str:
     s = raw or ""
     s = _ANSI_RE.sub("", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
-
     if "```" in s:
         s = s.split("```", 1)[0].strip()
 
@@ -812,15 +938,14 @@ def _clean_stage1_text(raw: str) -> str:
         if _is_ignored_line(ln):
             continue
         cleaned_lines.append(ln.strip())
-    s = "\n".join([ln for ln in cleaned_lines if ln]).strip()
 
+    s = "\n".join([ln for ln in cleaned_lines if ln]).strip()
     s = re.sub(r"[ \t]+", " ", s).strip()
 
     if len(s) > STAGE1_DRAFT_MAX_CHARS:
         s = s[:STAGE1_DRAFT_MAX_CHARS].rstrip() + "…"
     if len(s) > MAX_DRAFT_CHARS:
         s = s[:MAX_DRAFT_CHARS].rstrip() + "…"
-
     return s
 
 
@@ -877,8 +1002,6 @@ def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[b
     url = (req.url or LLAMA_DEFAULT_URL).strip() or LLAMA_DEFAULT_URL
 
     author, speech, stage1_user = build_stage1_user_text(req.prompt, mode=mode)
-
-    # ✅ deterministic short reply for greeting/thanks/bye/how-are-you
     canned = _stage1_canned(author, speech, mode=mode)
     if canned:
         b = canned.encode("utf-8", errors="ignore")
@@ -889,7 +1012,8 @@ def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[b
 
         return _gen_canned(), buf
 
-    final_prompt = build_llama3_chat_prompt(STAGE1_SYSTEM, stage1_user)
+    # ✅ Stage1 system gets profile + timestamp context
+    final_prompt = build_llama3_chat_prompt(_with_profile_and_time(STAGE1_SYSTEM()), stage1_user)
 
     body = {
         "prompt": final_prompt,
@@ -908,7 +1032,14 @@ def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[b
         "stop": STAGE1_STOP,
     }
 
-    log.info("[stage1] url=%s mode=%s n_predict=%s temp=%.3f top_p=%.3f", url, mode, body["n_predict"], body["temperature"], body["top_p"])
+    log.info(
+        "[stage1] url=%s mode=%s n_predict=%s temp=%.3f top_p=%.3f",
+        url,
+        mode,
+        body["n_predict"],
+        body["temperature"],
+        body["top_p"],
+    )
 
     buf = bytearray()
 
@@ -951,7 +1082,6 @@ def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[b
                     if not txt and not done:
                         continue
 
-                    # delta-safe: server might send full-so-far or true delta
                     if txt:
                         if len(txt) >= len(acc) and txt.startswith(acc):
                             acc = txt
@@ -972,7 +1102,6 @@ def stream_and_collect_llama_api(req: AskRequest, mode: str) -> Tuple[Iterator[b
 
                     if STAGE1_STREAM_MAX_BYTES > 0 and len(buf) >= STAGE1_STREAM_MAX_BYTES:
                         break
-
                     if cut >= 0 or done:
                         break
 
@@ -995,8 +1124,10 @@ async def _read_payload(request: Request) -> AskRequest:
         data = json.loads(raw_text) if raw_text.strip() else {}
     except Exception:
         raise HTTPException(status_code=400, detail="Body is not valid JSON")
+
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="JSON must be an object")
+
     try:
         payload = AskRequest.model_validate(data)
     except ValidationError:
@@ -1005,8 +1136,10 @@ async def _read_payload(request: Request) -> AskRequest:
     prompt = (payload.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Missing/empty 'prompt'")
+
     if len(prompt) > MAX_PROMPT_CHARS:
         payload.prompt = prompt[:MAX_PROMPT_CHARS]
+
     return payload
 
 
@@ -1034,6 +1167,21 @@ def serve_index():
 def health():
     return {
         "ok": True,
+        "prompts": {
+            "dir": str(PROMPTS_DIR),
+            "strict": PROMPTS_STRICT,
+            "auto_reload": PROMPTS_AUTO_RELOAD,
+            "files": {k: str(PROMPTS_DIR / v) for k, v in PROMPT_FILES.items()},
+        },
+        "time_context": {
+            "enabled": TIME_CONTEXT_ENABLED,
+            "tz": TIME_CONTEXT_TZ,
+            "location": TIME_CONTEXT_LOCATION,
+            "include_iso": TIME_CONTEXT_INCLUDE_ISO,
+        },
+        "profile_context": {
+            "enabled": PROFILE_CONTEXT_ENABLED,
+        },
         "stage1": {
             "default_url": LLAMA_DEFAULT_URL,
             "stream_stage1_default": STREAM_STAGE1_DEFAULT,
@@ -1086,7 +1234,7 @@ async def ask(req: Request):
     log.info("[/ask] prompt_len=%d preview=%r", len(prompt), prompt[:220])
 
     return StreamingResponse(
-        stream_ollama_chat(SYSTEM_PROMPT_CORRECTOR, prompt, OPTIONS_CORRECTOR, sanitize_newlines=True),
+        stream_ollama_chat(SYSTEM_PROMPT_CORRECTOR(), prompt, OPTIONS_CORRECTOR, sanitize_newlines=True),
         media_type="text/plain; charset=utf-8",
         headers=STREAM_HEADERS,
     )
@@ -1095,10 +1243,6 @@ async def ask(req: Request):
 # =========================
 # ✅ CHAIN CORE
 # =========================
-def _read_route(body: dict) -> str:
-    return str((body or {}).get("route", "")).strip().lower()
-
-
 def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: str) -> Iterator[bytes]:
     last = extract_last_valid(payload.prompt)
     if last:
@@ -1123,7 +1267,6 @@ def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: s
 
         draft_raw = _to_str(bytes(buf))
         draft = _clean_stage1_text(draft_raw)
-
     except Exception as e:
         draft = ""
         log.info("[chain] stage1_error=%s", e)
@@ -1133,13 +1276,8 @@ def chain_stream(payload: AskRequest, background_tasks: BackgroundTasks, mode: s
             yield b"\n"
 
     # ---- Stage 2: stream 120b (starts only after stage1 finishes)
-    if mode == "negativo":
-        sys_prompt = SYSTEM_PROMPT_PROFILE_NEGATIVE
-        options = OPTIONS_PROFILE_NEGATIVE
-    else:
-        sys_prompt = SYSTEM_PROMPT_PROFILE_POSITIVE
-        options = OPTIONS_PROFILE_POSITIVE
-
+    sys_prompt = get_stage2_profile_prompt(mode)
+    options = OPTIONS_PROFILE_NEGATIVE if mode == "negativo" else OPTIONS_PROFILE_POSITIVE
     user_text = build_profile_user_text(payload.prompt, draft=draft, context=ctx_now, mode=mode)
 
     log.info(
@@ -1167,10 +1305,8 @@ async def _ask_me_core(req: Request, background_tasks: BackgroundTasks, mode: st
         body = await req.json()
     except Exception:
         body = {}
-
-    route = _read_route(body)
+    route = str((body or {}).get("route", "")).strip().lower()
     mode = resolve_mode(route, mode)
-
     return StreamingResponse(
         chain_stream(payload, background_tasks, mode=mode),
         media_type="text/plain; charset=utf-8",
@@ -1186,69 +1322,6 @@ async def ask_me(req: Request, background_tasks: BackgroundTasks):
 @app.post("/ask_me_neg")
 async def ask_me_neg(req: Request, background_tasks: BackgroundTasks):
     return await _ask_me_core(req, background_tasks, mode="negativo")
-
-
-# =========================
-# 🧾 Context endpoints
-# =========================
-@app.post("/context_ingest")
-async def context_ingest(req: Request, background_tasks: BackgroundTasks):
-    try:
-        body = await req.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
-
-    prompt = _read_prompt_json(body)
-    if not prompt:
-        return JSONResponse({"error": "missing prompt"}, status_code=400)
-
-    last = extract_last_valid(prompt)
-    if not last:
-        return JSONResponse({"error": "no valid line found"}, status_code=400)
-
-    push_clean_message(last["author"], last["text"])
-    background_tasks.add_task(refresh_context_background)
-
-    with STATE_LOCK:
-        buf_size = len(CLEAN_BUFFER)
-        ctx = CONTEXT_TEXT
-        at = LAST_CONTEXT_AT
-
-    return {
-        "accepted": True,
-        "parsed": {"author": last["author"], "text": last["text"], "raw": last["raw"]},
-        "buffer_size": buf_size,
-        "context_current": ctx,
-        "context_updated_at": at,
-    }
-
-
-@app.get("/context")
-def get_context():
-    with STATE_LOCK:
-        return {
-            "context": CONTEXT_TEXT,
-            "updated_at": LAST_CONTEXT_AT,
-            "buffer_size": len(CLEAN_BUFFER),
-            "last_items": CLEAN_BUFFER[-3:],
-        }
-
-
-@app.post("/context_refresh")
-def context_refresh():
-    try:
-        ctx = refresh_context_sync()
-        with STATE_LOCK:
-            at = LAST_CONTEXT_AT
-        return {"ok": True, "context": ctx, "updated_at": at}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-
-@app.get("/buffer")
-def get_buffer():
-    with STATE_LOCK:
-        return {"buffer_size": len(CLEAN_BUFFER), "items": CLEAN_BUFFER[-30:]}
 
 
 # =========================
